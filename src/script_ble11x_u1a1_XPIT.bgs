@@ -1,0 +1,2859 @@
+# ================================================================
+# SPP-BLE-FHNW  - BLE11x UART1/Alt1 endpoint variant
+# renamed: EXPLORE-IT HM10 Version!
+#
+# using acknowledged data transfer (indications) 
+#
+# FHNW last edit: 16.1.2020 P.St.   search for artefact while beaming data
+# consumes : 283 variables:
+# ----------------------------------------------------------------
+#
+# CHANGELOG
+#	2019-10-15 - VER_006 Transmission B-Command 
+#
+#1:            Länge 2                0x00, 0x25 (oder besser die Länge, also 38 in Bytes, also 0x00, 0x26)
+#                                               So kann maximal 65535 Bytes übertragen werden oder 32767 Programmzeilen.
+#                                               Alternativ könnte man auch die Anzahl Programmzeilen übertragen (also die Länge / 2)
+#
+#2:            Länge 19              0x00, 0xYY, 0xYY, ., 0xYY             (Sequenznummer 0x00 + 18 Bytes = 9 Programmzeilen, Total 19 Bytes)
+#
+#3:            Länge 19              0x01, 0xYY, 0xYY, ., 0xYY             (Sequenznummer 0x01 + 18 Bytes = 9 Programmzeilen, Total 19 Bytes)
+#
+#4:            Länge 3                0x02, 0xYY, 0xYY                              (Sequenznummer 0x02 + 2 Bytes = 1 Programmzeile, Total 3 Bytes)
+
+ 
+ 
+#	2019-10-04 - VER_005 binary transmission for B and E command
+#	2019-10-04 - VER_0042 PWM_L eingefügt; ^@ _END ist jetzt weg; 
+#	2019-30-08 - Artefacts search XPIT_VER = 004
+#   2019-22-08 - XPIT_VER = 003; remove unused commands
+#   2019-07-13 - todo: remove LR speed calibration; why is Interval after programming I=48 or I=49 ???
+#				 todo: blink auf ports P0_4 and P0_5
+#				 P0_4 and P0_5 set currently both LOW at startup for HW3, later with HW4 it needs a change:
+#				 Set as output to mark "1", set as input to mark "0"; consumes current!! Use P1.3??  unsolved!!
+#   2019-07-06 - added to VER 002: ROB_MAX_FLASH no longer depending on ROB_SAMPLE_INTERVAL; range check enough?
+#   2019-01-27 - incl. version inquiery command "Z"; XPIT_VER = 002
+#   2018-05-20 - incl. LR Correction with command: V for left and W for right Correction factor  VER 1.2.0.1; XPIT_VER = 1
+#   2018-05-13 - scripting enabled; speedfactor and circlefactor stored in flash
+#   2018-05-13 - sampling rate changeable with command "I" Interval
+#   2018-05-02 - Adaption PWM speed with calibration factor; ca. 0.8...1.25; default ca 1.0 (Value S10)
+#   2018-05-01 - Receive protocoll : 123x123xx
+#   2018-04-23 - correcting CR LF with HM10 GATT
+#   2018-01-03 - adding CR to data beam-up for better processing of data in spreadsheet
+#				 try to add: dampingfactor on PWM (currently rob runs too fast)
+#				 try to add: new command to change length Command "D"
+#   2018-01-03 - working on 16 prototypes boards; one tested with motors : OK!
+#   2018-15-02 - disc 0208 message coming on unit with motors; unclear why, all other do not do this 
+#   2017-29-12 - with PWM output; LED activation P1.0 P1.1 P1.2 "T" State=7 used temporarly  => all remarked #PST#hardware_io_port_write(1,  all status flag instances
+# 				 revise GO and RUN commands !!
+#				 all comment-outputs to BLE-UART removed 
+#   2017-08-10 - Ver. 1.2.0.0 flash used as 	<user_data size="0x2000" />
+#   2016-03-21 - Ver. 1.1.0  remove local echo
+#   2013-11-15 - Initial copy from bluegiga script v1.0.9.1
+#
+# ================================================================
+
+# NOTE: YOU MUST USE AT LEAST BLE SDK v1.2.0-88 TO BUILD THIS!
+# 
+# Commands "ATV" and "ATW" "ATY" "ATZ"  "ATC"
+#          still make local echo; use as test commands!
+
+# Status of connection at P1.0 and P1.1 remarked so that 
+# XPIT: LED on P1.2; Motors P1.0 and P1.1
+# remarked lines around line 300: local DFU condition not active anymore for XPIT
+# line around 411: check for automatic ping-pong mode (P0_0 high at boot)
+
+# using acknowledged data transfer (indications)
+# using unacknowledged data transfer (notifications)
+			   
+#const XPIT_VER = 004		# defined as 3 decimal digits; Valid only if changed inside script ca. line 2048
+                            # search for :  "Z"  (0x5A) :
+
+const DEBUG_ENABLE = 0
+
+const USE_ENDPOINT = 5 # (system_endpoint_uart1)
+
+const FLAG_IS_ADVERTISING = 0
+const FLAG_IS_SCANNING = 1
+const FLAG_IS_CONNECTING = 2
+const FLAG_IS_CONNECTED = 3
+const FLAG_IS_ENCRYPTED = 4
+const FLAG_IS_MASTER = 5
+const FLAG_IS_DATAMODE = 6
+
+const HANDLE_TIMER_PINGPONG = 0
+const HANDLE_TIMER_CONNTIMEOUT = 1
+
+const BLEROLE_AT = 0
+const BLEROLE_MASTER = 1
+const BLEROLE_SLAVE = 2
+const BLEROLE_PINGPONG = 3
+
+# needs to be odd number!! 2^x -1
+# maximum tested so far: 8191
+#const ROB_MAX_FLASH = 31  
+#const ROB_MAX_FLASH = 63  
+const ROB_MAX_FLASH_CONST = 8191
+
+dim status_flags(2)
+    # -- BYTE 0 (written as [PORT1 & 0x7F] output) --
+    # bit 0: is advertising
+    # bit 1: is scanning
+    # bit 2: is connecting (connection pending)
+    # bit 3: is connected
+    # bit 4: is encrypted
+    # bit 5: is master
+    # bit 6: is in data mode
+    # -- BYTE 1 (internal) --
+    # bit 0: auto-connect in scan mode
+    # bit 1: ping-pong mode enabled
+
+##dim in(20)              # endpoint data in
+dim in(20)              # endpoint data in
+dim in_len
+##dim out(20)             # endpoint data out
+dim out(20)             # endpoint data out
+dim out_len
+
+dim i                   # generic working integer 1
+dim j                   # generic working integer 2
+dim k                   # generic working integer 3
+dim temp_buf(32)        # generic working byte buffer   all used 0...31
+
+dim gpio_input_state(1) # GPIO input state (P0_* pins)
+
+dim ret_result          # "result" return value holder
+dim ret_value_len       # "value_len" return value holder
+
+dim adv_data(28)        # custom advertisement data buffer
+dim sr_data(20)         # custom scan response data buffer (friendly name for active scanning)
+
+dim ack_this_write(1)   # controls whether write is acknowledged
+
+dim config_page_1(3)    # identification keys
+dim config_page_2(17)   # device name
+dim config_page_3(18)   # BLE connection
+dim config_page_4(5)    # host interface configuration
+dim config_page_5(2)    # power management configuration
+
+dim rand_factor         # pseudo-random multiplier (uses temperature + serial number)
+
+dim pp_time_advertising # timer interval for advertising period
+dim pp_time_scanning    # timer interval for scanning
+
+# Original: dim cmd_buf(32)         # AT command buffer
+dim cmd_buf(27)         # AT command buffer  0..26  ; up to 24 were used;  we take 25 + 26 as scratch 
+						# cmd_buf(28) => cmd_buf(27) reduces Script Variables from 280 to 279 according compiler 
+dim cmd_buf_len         # AT command length
+
+# XPIT stuff
+# New from 1.5.2018
+dim LR_FLAG				# L=0 R=1
+
+# New from 30.3.2018 
+dim ROB_MAX_FLASH
+
+# 20.05.2018 : consumes 4 more bytes; number of script variables are now at 275
+dim ROB_LEFT_CORR
+dim ROB_RIGHT_CORR
+
+#VER_0042
+dim PWM_L
+dim PWM_R
+
+# and 13.5.2018
+dim	ROB_SAMPLE_INTERVAL
+# VEr 1 was: ROB_MAX_FLASH = (FLASH length [sec] * 2 * ROB_SAMPLE_INTERVAL ) - 1
+# with VER = 002 no longer; ROB_MAX_FLASH only changed through d - command
+
+# and 13.5.2018 for scripting; consumes 2*4 Bytes; Compiler says: Script Variables increased from 272 to 280
+#dim	speedfactor
+#dim circlefactor
+
+dim ROB_STATE			# indexer state machine of ROB-APP
+						# 0 = IDLE
+						# 1 = MEM_STATUS
+						# 2 = LEARN
+						# 3 = BEAM_IT
+						# 4 = GO
+						# 5 = STOP
+						# 6 = RECEIVE_IT
+						# 7 = FREE_RUN
+dim ROB_count
+
+dim ROB_paket_counter	# introduced with VER 006 used for B-Command transmission
+
+#dim ROB_MEM_STATUS		# 0 = empty
+						# 1 = filling
+						# 2 = full
+						
+#dim ROB_count_high
+#dim ROB_I
+
+#dim ROB_RESPONSE(2)
+#dim ROB_temp_buf(32)
+
+# Memory :
+# flash_ps_save($8000) =  mark settings as initialized with $b8
+# flash_ps_save($8001) = Identification keys
+# flash_ps_save($8002) = config_page_2       MAC ADDRESS 18byte how exactly done?
+# flash_ps_save($8003) = config_page_3(0:18) BLE CONNECTION
+# flash_ps_save($8004) = config_page_4(0:5) HOST INTERFACE
+# flash_ps_save($8005) = config_page_5(0:2) POWER MANAGEMENT
+# flash_ps_save($8006) = Flash_length (duration) until Version: V1 no longer valid from Ver 002; see $8013-$8016
+# flash_ps_save($8007) = BOB_LEFT_CORR
+# flash_ps_save($8008) = Interval
+# flash_ps_save($8009) = Speed_factor
+# flash_ps_save($8010) = circle_factor
+# flash_ps_save($8011) = BOB_RIGHT_CORR
+# flash_ps_save($8012) unused yet
+# flash_ps_save($8013) Duration in 4 HEX chars LSBYTE Endian
+# flash_ps_save($8014)
+# flash_ps_save($8015)
+# flash_ps_save($8016) MSBYTE
+
+# end XPIT stuff
+
+# flexible procedure to display %02X byte arrays
+dim hex_buf(3)  # [0,1] = ASCII hex representation, [2]=separator
+dim hex_index   # byte array index
+
+
+procedure print_hex_bytes(endpoint, separator, reverse, b_length, b_data())
+    hex_buf(2:1) = separator
+    hex_index = 0
+    while hex_index < b_length
+        if reverse = 0 then
+            hex_buf(0:1) = (b_data(hex_index:1)/$10) + 48 + ((b_data(hex_index:1)/$10)/10*7)
+            hex_buf(1:1) = (b_data(hex_index:1)&$f)  + 48 + ((b_data(hex_index:1)&$f )/10*7)
+        else
+            hex_buf(0:1) = (b_data(b_length - hex_index - 1:1)/$10) + 48 + ((b_data(b_length - hex_index - 1:1)/$10)/10*7)
+            hex_buf(1:1) = (b_data(b_length - hex_index - 1:1)&$f)  + 48 + ((b_data(b_length - hex_index - 1:1)&$f )/10*7)
+        end if
+        if separator > 0 && hex_index < b_length - 1 then
+            call system_endpoint_tx(endpoint, 3, hex_buf(0:3))
+        else
+            call system_endpoint_tx(endpoint, 2, hex_buf(0:2))
+        end if
+        hex_index = hex_index + 1
+    end while
+end
+
+procedure print_int8(endpoint, num)
+    ret_result = num & $ff
+    if ret_result = 0 then
+        call system_endpoint_tx(endpoint, 1, "0")
+    else
+        if ret_result > $7f then
+            call system_endpoint_tx(endpoint, 1, "-")
+            ret_result = 128 - (ret_result & $7f)
+        end if
+        hex_buf(0:1) = (ret_result / 100) + 48
+        hex_buf(1:1) = (ret_result / 10) + (ret_result / -100 * 10) + 48
+        hex_buf(2:1) = ret_result + (ret_result / 10 * -10) + 48
+        if ret_result > 99 then
+            call system_endpoint_tx(endpoint, 3, hex_buf(0:3))
+        else
+            if ret_result > 9 then
+                call system_endpoint_tx(endpoint, 2, hex_buf(1:2))
+            else
+                call system_endpoint_tx(endpoint, 1, hex_buf(2:1))
+            end if
+        end if
+    end if
+end
+
+# convert a 2-byte ASCII hex (0-9, A-F, must be CAPITALIZED) to binary byte
+procedure parse_hexbyte_to_temp_buf(buf())
+    if buf(0:1) > $40 then
+        hex_index = (buf(0:1) - 55) << 4
+    else
+        hex_index = (buf(0:1) - 48) << 4
+    end if
+    if buf(1:1) > $40 then
+        hex_index = hex_index + (buf(1:1) - 55)
+    else
+        hex_index = hex_index + (buf(1:1) - 48)
+    end if
+    temp_buf(0:1) = hex_index
+end
+
+# start specific SPP-over-BLE role (assumes nothing else is happening already)
+procedure start_spp_role(spp_role)
+    # check role and act on it (if not prevented by GPIO)
+    if (gpio_input_state(0:1) & $40) = 0 then
+        if spp_role = BLEROLE_PINGPONG then
+            # master/slave ping-pong (advertise first)
+
+            if DEBUG_ENABLE = 1 then
+                # DEBUG
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 17, "ROLE: PING-PONG\r\n")
+            end if
+            
+            # update status
+            status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_ADVERTISING)
+            #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+
+            # send ADV event
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 5, "ADV\r\n")
+
+            # put module into discoverable/connectable mode (with user-defined advertisement data)
+            call gap_set_mode(gap_user_data, gap_undirected_connectable)
+            
+            # start ad/scan ping-pong one-shot
+            call hardware_set_soft_timer(pp_time_advertising, HANDLE_TIMER_PINGPONG, 1)
+        end if
+        if spp_role = BLEROLE_MASTER then
+            # master only, so just scan
+            
+            if DEBUG_ENABLE = 1 then
+                # DEBUG
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 14, "ROLE: MASTER\r\n")
+            end if
+
+            # update status
+            status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_SCANNING)
+            #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+            
+            # send SCAN event
+			# Ver. 1.1.0 next line remarked 
+            #call system_endpoint_tx(USE_ENDPOINT, 6, "SCAN\r\n")
+
+            # start discovery
+            call gap_discover(gap_discover_generic)
+        end if
+        if spp_role = BLEROLE_SLAVE then
+            # slave only, so just advertise
+            
+            if DEBUG_ENABLE = 1 then
+                # DEBUG
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 13, "ROLE: SLAVE\r\n")
+            end if
+
+            # update status
+            status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_ADVERTISING)
+            #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+
+            # send ADV event
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 5, "ADV\r\n")
+
+            # put module into discoverable/connectable mode (with user-defined advertisement data)
+            call gap_set_mode(gap_user_data, gap_undirected_connectable)
+        end if
+    end if
+end
+
+event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
+    # DEBUG
+    #call system_endpoint_tx(USE_ENDPOINT, 6, "BOOT\r\n")
+
+    # ----------------------------------------
+    # initialize I/O directions and interrupts
+    # ----------------------------------------
+	
+    # enable interrupt detection on P0_1/6 pins
+### remarked 1.1.18 PST 	call hardware_io_port_config_irq(0, $42, 0)
+    
+    # PORT1 pins are all outputs (other than P1_7 for DC/DC converter)
+    call hardware_io_port_config_direction(1, $7f)
+	#PST example: Configure P0_1 and P0_6 as output (port=0, pin mode mask = 0b01000010)
+	#PST call hardware_io_port_config_direction(0, $42) #P0.1 und P0.6
+  
+    # initialize status flags/pins
+    status_flags(0:1) = $00 # all statuses = 0 at boot
+    #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+
+# new with VER = 002
+	call hardware_io_port_config_function(0, $cF)		# mask = 0b11001111 = $cF
+	# Configure P0_4 and P0_5 as output (port=0, pin mode mask = 0b00110000)
+	call hardware_io_port_config_direction(0, $30)
+	# Set P0_4 and P0_5 both pins LOW at startup for HW3; change for HW4
+	# (port=0, pin selection mask = 0b00110000, pin logic mask = 0b00000000)
+	call hardware_io_port_write(0, $30, $00)
+
+	# switch LED=OFF; low active means Port P1.2=> "1" ;ditto with motors
+	# configure pin P1_x? as GPIO pin
+	call hardware_io_port_config_function(1, $00)
+	# hardware_io_port_write(PORT=1, MASK=$07, VALUE=$07)
+	call hardware_io_port_write(1, $07, $07)
+    # XPIT: LEDs and Motors OFF => write "1" to P1.0 P1.1 P1.2	(may have "pull down" definition in hardware.xml)			
+
+				
+    # get initial PORT0 input GPIO state (pins 0/1/6/7)
+    call hardware_io_port_read(0, $c3)(ret_result, i, gpio_input_state(0:1))
+    
+    # check for local DFU condition (all relevant input GPIOs high)
+ ###   if (gpio_input_state(0:1) & $c3) = $c3 then
+ ###       # local host requested DFU reboot
+ ###  remarked PST 1.1.18      call system_reset(1)
+###    end if
+
+    # ------------------------------------
+    # load (or initialize) device settings
+    # ------------------------------------
+
+	#XPIT: set default values for scripting
+	#speedfactor = 99; use FLASH ADDRESS ($8009)
+    #circlefactor = 50; use FLASH ADDRESS ($8010)
+
+		#XPIT: recall last speedfactor
+	call flash_ps_load($8009)(ret_result, ret_value_len, cmd_buf(25:1)) 
+	if cmd_buf(25:1) > 99 then
+		cmd_buf(25:1) = 99
+		call flash_ps_save($8009, 1, cmd_buf(25:1))	
+	end if
+	if cmd_buf(25:1) < 1 then
+		cmd_buf(25:1) = 99
+		call flash_ps_save($8009, 1, cmd_buf(25:1))	
+	end if	
+	
+	
+	#XPIT: recall last circlefactor
+	call flash_ps_load($8010)(ret_result, ret_value_len, cmd_buf(25:1)) 
+	if cmd_buf(25:1) > 99 then
+		cmd_buf(25:1) = 50
+		call flash_ps_save($8010, 1, cmd_buf(25:1))	
+	end if
+	if cmd_buf(25:1) < 1 then
+		cmd_buf(25:1) = 50
+		call flash_ps_save($8010, 1, cmd_buf(25:1))	
+	end if	
+
+	
+	#XPIT: recall last used ROB_RIGHT_CORR (W) for compensation of unsymmetrical drive)
+	call flash_ps_load($8011)(ret_result, ret_value_len, cmd_buf(25:1)) 
+	if cmd_buf(25:1) > 20 then
+		cmd_buf(25:1) = 10
+		call flash_ps_save($8011, 1, cmd_buf(25:1))	
+	end if
+	if cmd_buf(25:1) < 1 then
+		cmd_buf(25:1) = 10
+		call flash_ps_save($8011, 1, cmd_buf(25:1))	
+	end if	
+	ROB_RIGHT_CORR = cmd_buf(25:1)
+
+
+	#XPIT: recall last used ROB_LEFT_CORR (V) for compensation of unsymmetrical drive)
+	call flash_ps_load($8007)(ret_result, ret_value_len, cmd_buf(25:1)) 
+	if cmd_buf(25:1) > 20 then
+		cmd_buf(25:1) = 20
+		call flash_ps_save($8007, 1, cmd_buf(25:1))
+	end if
+	if cmd_buf(25:1) < 1 then
+		cmd_buf(25:1) = 10
+		call flash_ps_save($8007, 1, cmd_buf(25:1))
+	end if	
+	ROB_LEFT_CORR = cmd_buf(25:1)
+	
+
+	#XPIT: recall last used Interval value (sampling rate) between 1 and 50 samples/sec
+	call flash_ps_load($8008)(ret_result, ret_value_len, cmd_buf(25:1)) 
+		if cmd_buf(25:1) > 50 then
+			cmd_buf(25:1) = 50
+			call flash_ps_save($8008, 1, cmd_buf(25:1))
+		end if
+		if cmd_buf(25:1) < 1 then
+			cmd_buf(25:1) = 1
+			call flash_ps_save($8008, 1, cmd_buf(25:1))
+		end if	
+	ROB_SAMPLE_INTERVAL = cmd_buf(25:1)
+
+########### until Ver 1 ########################################
+#	#XPIT: recall last used FLASH length [sec] adapted with sample rate
+#	call flash_ps_load($8006)(ret_result, ret_value_len, cmd_buf(25:1))  
+#	if cmd_buf(25:1) > 80 then
+#		cmd_buf(25:1) = 80
+#		call flash_ps_save($8006, 1, cmd_buf(25:1))
+#	end if
+#	if cmd_buf(25:1) < 1 then
+#		cmd_buf(25:1) = 1
+#		call flash_ps_save($8006, 1, cmd_buf(25:1))
+#	end if
+#	ROB_MAX_FLASH = (cmd_buf(25:1) * 2 * ROB_SAMPLE_INTERVAL ) - 1	## MUST BE defined at this point!!
+########### until Ver 1 ########################################
+
+######new with XPIT_Ver = 002 
+# Duration is saved as 4 HEX Values and must be converted to an integer here
+ 	call flash_ps_load($8013)(ret_result, ret_value_len, cmd_buf(25:1))  # NEW 4 bytes used for HEX Value stored!!! 
+	call flash_ps_load($8014)(ret_result, ret_value_len, cmd_buf(26:1))
+	call flash_ps_load($8015)(ret_result, ret_value_len, cmd_buf(27:1))
+	call flash_ps_load($8016)(ret_result, ret_value_len, cmd_buf(28:1))
+	if cmd_buf(28:1) < $31 && cmd_buf(27:1) < $31	&& cmd_buf(26:1) < $31 && cmd_buf(25:1) < $31		
+	# value is lower than 0x0001 ; 0x31 is dec49 means "1"
+		cmd_buf(28:1) = "0"
+		cmd_buf(27:1) = "0"
+		cmd_buf(26:1) = "0"
+		cmd_buf(25:1) = "1"
+		call flash_ps_save($8013, 1, cmd_buf(25:1))			# VER 002:   4 bytes !!!!!!	 LSBYTE Endian !!!
+		call flash_ps_save($8014, 1, cmd_buf(26:1))			# VER 002:   4 bytes !!!!!!	 			
+		call flash_ps_save($8015, 1, cmd_buf(27:1))			# VER 002:   4 bytes !!!!!!	 
+		call flash_ps_save($8016, 1, cmd_buf(28:1))			# VER 002:   4 bytes !!!!!!	 MSByte !!!		
+	end if
+	
+	if cmd_buf(28:1) > $31 then			# value was higher than 0x1FFF  = 8191
+		cmd_buf(28:1) = "1"
+		cmd_buf(27:1) = "F"
+		cmd_buf(26:1) = "F"
+		cmd_buf(25:1) = "F"
+		call flash_ps_save($8013, 1, cmd_buf(25:1))			# VER 002:   4 bytes !!!!!!	 LSBYTE Endian !!!
+		call flash_ps_save($8014, 1, cmd_buf(26:1))			# VER 002:   4 bytes !!!!!!	 			
+		call flash_ps_save($8015, 1, cmd_buf(27:1))			# VER 002:   4 bytes !!!!!!	 
+		call flash_ps_save($8016, 1, cmd_buf(28:1))			# VER 002:   4 bytes !!!!!!	 MSByte !!!				
+	end if						
+	# calculate FLASHPOINTER; Conversion of 4 HEX CHAR to INT-Value same as with d command
+	if cmd_buf(28:1) > $40 then						# check if CHAR?
+		hex_index = (cmd_buf(28:1) - 55) << 4		# only CAPITAL CHARs are correct!!
+	else											# was a number
+		hex_index = (cmd_buf(28:1) - 48) << 4
+	end if
+	if cmd_buf(27:1) > $40 then
+		hex_index = ( hex_index + (cmd_buf(27:1) - 55) ) << 4
+	else
+		hex_index = ( hex_index + (cmd_buf(27:1) - 48) ) << 4
+	end if
+	if cmd_buf(26:1) > $40 then
+		hex_index = ( hex_index + (cmd_buf(26:1) - 55) ) << 4
+	else
+		hex_index = ( hex_index + (cmd_buf(26:1) - 48) ) << 4
+	end if
+	if cmd_buf(25:1) > $40 then
+		hex_index = hex_index + (cmd_buf(25:1) - 55)
+	else
+		hex_index = hex_index + (cmd_buf(25:1) - 48)
+	end if
+	# VER 1 was: 	ROB_MAX_FLASH = (cmd_buf(25:1) * 2 * ROB_SAMPLE_INTERVAL ) - 1
+	ROB_MAX_FLASH = hex_index  ## MUST BE defined at this point!!
+				
+###### end new with XPIT_Ver = 002 
+  
+    call flash_ps_load($8000)(ret_result, ret_value_len, temp_buf(0:ret_value_len))
+    if temp_buf(0:1) != $b8 || gpio_input_state(0:1) >= $80 then
+        # settings have not been initialized or are being reset, so write defaults
+        
+        # DEBUG
+        #call system_endpoint_tx(USE_ENDPOINT, 16, "RESET SETTINGS\r\n")
+        
+        # mark settings as initialized
+        temp_buf(0:1) = $b8
+        call flash_ps_save($8000, 1, temp_buf(0:1))
+        
+        # config page 1 - identification keys
+        config_page_1(0:1) = $00    # connection key MSB \___ default 0x0000
+        config_page_1(1:1) = $00    # connection key LSB /
+        config_page_1(2:1) = $00    # connection channel, default 0x00
+        call flash_ps_save($8001, 3, config_page_1(0:3))
+        
+        # config page 2 - device name
+        # get Bluetooth MAC address of this device (NOTE: this is little-endian!)
+        call system_address_get()(temp_buf(0:6))
+
+        # write default device name
+        #config_page_2(0:1) = $10    # device name length, default 16 bytes (set below)  45 58 50 4C 4F 52 45
+        #config_page_2(1:1) = $42  # 'B'
+        #config_page_2(2:1) = $4c  # 'L'
+        #config_page_2(3:1) = $45  # 'E'
+        #config_page_2(4:1) = $20  # ' '
+        #config_page_2(5:1) = $53  # 'S'
+        #config_page_2(6:1) = $50  # 'P'
+        #config_page_2(7:1) = $50 # 'P'
+        #config_page_2(8:1) = $20 # ' '
+		
+        config_page_2(0:1) = $10    # device name length, default 16 bytes (set below)  45 58 50 4C 4F 52 45
+        config_page_2(1:1) = $45  # 'E'
+        config_page_2(2:1) = $58  # 'X'
+        config_page_2(3:1) = $50  # 'P'
+        config_page_2(4:1) = $4C  # 'L'
+        config_page_2(5:1) = $4F  # 'O'
+        config_page_2(6:1) = $52  # 'R'
+        config_page_2(7:1) = $45 # 'E'
+        config_page_2(8:1) = $2D # '-'		
+		
+# ----- XPIT
+		config_page_2(9:1) = $49 # 'I'
+        config_page_2(10:1) = $54 # 'T'
+        config_page_2(11:1) = $20 # ' '
+# ----- XPIT		
+#        config_page_2(9:1) = (temp_buf(2:1)/$10) + 48 + ((temp_buf(2:1)/$10)/10*7) # MAC byte 4 10's digit
+#        config_page_2(10:1) = (temp_buf(2:1)&$f)  + 48 + ((temp_buf(2:1)&$f )/10*7) # MAC byte 4 1's digit
+#        config_page_2(11:1) = $3a # ':'
+
+        config_page_2(12:1) = (temp_buf(1:1)/$10) + 48 + ((temp_buf(1:1)/$10)/10*7) # MAC byte 5 10's digit
+        config_page_2(13:1) = (temp_buf(1:1)&$f)  + 48 + ((temp_buf(1:1)&$f )/10*7) # MAC byte 5 1's digit
+        config_page_2(14:1) = $3a # ':'
+   
+   config_page_2(15:1) = (temp_buf(0:1)/$10) + 48 + ((temp_buf(0:1)/$10)/10*7) # MAC byte 6 10's digit
+        config_page_2(16:1) = (temp_buf(0:1)&$f)  + 48 + ((temp_buf(0:1)&$f )/10*7) # MAC byte 6 1's digit
+        call flash_ps_save($8002, 17, config_page_2(0:17))
+        
+        # config page 3 - BLE connection
+        ##config_page_3(0:1) = BLEROLE_AT     # role, default "AT" (wait for command)
+        #config_page_3(0:1) = BLEROLE_PINGPONG   # role, default master/slave ping-pong
+		# for ROB_XPIT best: BLEROLE_SLAVE = 2
+		config_page_3(0:1) = BLEROLE_SLAVE
+		
+        config_page_3(1:1) = $04    # ping-pong time to split between ad/scan, default 4 sec
+        config_page_3(2:2) = $00c8  # scan interval, default 125ms (200 * 0.625ms)
+        config_page_3(4:2) = $00c8  # scan window, default 125ms (200 * 0.625ms)
+        config_page_3(6:2) = $0200  # advertisement interval, default 320ms (512 * 0.625ms)
+        config_page_3(8:2) = $0001  # connection interval, default 20ms (16 * 1.25ms) Test 0x0004 : 5ms  / XPIT: was $0008
+        config_page_3(10:2) = $0064 # supervision timeout, default 1000ms (100 * 10ms)
+        config_page_3(12:2) = $0000 # slave latency, default 0
+        config_page_3(14:1) = $05   # connection attempt timeout, default 5 seconds
+        config_page_3(15:1) = $00   # connection update delegation, default 0 = slave requests
+        config_page_3(16:1) = $00   # security, default disabled (no encryption required)
+        config_page_3(17:1) = $00   # transmission type, default safe (indications)
+        call flash_ps_save($8003, 18, config_page_3(0:18))
+        
+        # config page 4 - host interface
+        config_page_4(0:1) = $01    # outgoing watermark, default 1 byte (any/all data)
+        ##config_page_4(1:1) = $d8    # UART baud rate mantissa, default 0xD8 (216) \___ 115,200
+        ##config_page_4(2:1) = $0b    # UART baud rate exponent, default 0x0B (11)  /
+        config_page_4(1:1) = $3b    # UART baud rate mantissa, default 0x3B (59) \___ 9,600
+        config_page_4(2:1) = $08    # UART baud rate exponent, default 0x08 (8)  /
+        config_page_4(3:1) = $01    # flow control, default enabled
+        config_page_4(4:1) = $01    # debug output, default disabled
+        call flash_ps_save($8004, 5, config_page_4(0:5))
+        
+        # config page 5 - power management
+        config_page_5(0:1) = $0e    # TX power, 15 default (max)
+        config_page_5(1:1) = $00    # sleep mode, default disabled
+        call flash_ps_save($8005, 2, config_page_5(0:2))
+    else
+        # settings have been initialized already, so load them
+
+        # DEBUG
+        #call system_endpoint_tx(USE_ENDPOINT, 15, "LOAD SETTINGS\r\n")
+
+        call flash_ps_load($8001)(ret_result, ret_value_len, config_page_1(0:ret_value_len))
+        call flash_ps_load($8002)(ret_result, ret_value_len, config_page_2(0:ret_value_len))
+        call flash_ps_load($8003)(ret_result, ret_value_len, config_page_3(0:ret_value_len))
+        call flash_ps_load($8004)(ret_result, ret_value_len, config_page_4(0:ret_value_len))
+        call flash_ps_load($8005)(ret_result, ret_value_len, config_page_5(0:ret_value_len))
+    end if
+    
+    # check for automatic ping-pong mode (P0_0 high at boot)
+    if (gpio_input_state(0:1) & $c3) = $01 then
+       config_page_3(0:1) = BLEROLE_PINGPONG
+    end if
+
+    # apply baud rate settings (USART1)
+    call system_reg_write($70fa, config_page_4(1:1))    # mantissa, BAUD_M
+    call system_reg_write($70fc, config_page_4(2:1))    # exponent, BAUD_E 
+    
+    # apply flow control settings (USART1)
+    call system_reg_write($70fb, 2 | (config_page_4(3:1) << 6)) # flow + stop bit setting
+
+    if DEBUG_ENABLE = 1 then
+        # DEBUG
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "GPIO: ")
+        temp_buf(0:1) = (gpio_input_state(0:1)/$10) + 48 + ((gpio_input_state(0:1)/$10)/10*7)
+        temp_buf(1:1) = (gpio_input_state(0:1)&$f)  + 48 + ((gpio_input_state(0:1)&$f )/10*7)
+        # Ver. 1.1.0 next line remarked 
+		##call system_endpoint_tx(USE_ENDPOINT, 2, temp_buf(0:2))
+        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+        # Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "CFG1: ")
+        i = 0
+        while i < 3
+            temp_buf(0:1) = (config_page_1(i:1)/$10) + 48 + ((config_page_1(i:1)/$10)/10*7)
+            temp_buf(1:1) = (config_page_1(i:1)&$f)  + 48 + ((config_page_1(i:1)&$f )/10*7)
+            temp_buf(2:1) = $20
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(0:3))
+            i = i + 1
+        end while
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+        
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "CFG2: ")
+        i = 0
+        while i < config_page_2(0:1) + 1
+            temp_buf(0:1) = (config_page_2(i:1)/$10) + 48 + ((config_page_2(i:1)/$10)/10*7)
+            temp_buf(1:1) = (config_page_2(i:1)&$f)  + 48 + ((config_page_2(i:1)&$f )/10*7)
+            temp_buf(2:1) = $20
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(0:3))
+            i = i + 1
+        end while
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+        
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "CFG3: ")
+        i = 0
+        while i < 18
+            temp_buf(0:1) = (config_page_3(i:1)/$10) + 48 + ((config_page_3(i:1)/$10)/10*7)
+            temp_buf(1:1) = (config_page_3(i:1)&$f)  + 48 + ((config_page_3(i:1)&$f )/10*7)
+            temp_buf(2:1) = $20
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(0:3))
+            i = i + 1
+        end while
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+        
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "CFG4: ")
+        i = 0
+        while i < 5
+            temp_buf(0:1) = (config_page_4(i:1)/$10) + 48 + ((config_page_4(i:1)/$10)/10*7)
+            temp_buf(1:1) = (config_page_4(i:1)&$f)  + 48 + ((config_page_4(i:1)&$f )/10*7)
+            temp_buf(2:1) = $20
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(0:3))
+            i = i + 1
+        end while
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+        
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "CFG5: ")
+        i = 0
+        while i < 2
+            temp_buf(0:1) = (config_page_5(i:1)/$10) + 48 + ((config_page_5(i:1)/$10)/10*7)
+            temp_buf(1:1) = (config_page_5(i:1)&$f)  + 48 + ((config_page_5(i:1)&$f )/10*7)
+            temp_buf(2:1) = $20
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(0:3))
+            i = i + 1
+        end while
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+    end if
+
+    # -------------------------------
+    # build custom advertisement data
+    # -------------------------------
+    
+    # flags for discoverable/connectable
+    adv_data(0:1) = $02 # ad field length = 2 bytes
+    adv_data(1:1) = gap_ad_type_flags   # ad field type = 0x01 (Flags)
+    adv_data(2:1) = $06 # flags = 0x06, connectable/undirected
+ 
+    # SPP-over-BLE service ID
+    adv_data(3:1) = $11 # ad field length = 17 bytes
+    adv_data(4:1) = gap_ad_type_services_128bit_all
+	# next is original Bluegiga, used for XPIT
+ ###   adv_data(5:16) = "\xf6\xec\x37\xdb\xbd\xa1\x46\xec\xa4\x3a\x6d\x86\xde\x88\x56\x1d"
+# next is for test with BLUNO IOS App
+    #adv_data(5:16) = "\xb2\xdf\x9b\x5f\x80\x00\x00\x80\x00\x10\x00\x00\xb0\xdf\x00\x00"
+# next is for test with aircable
+    #adv_data(5:16) = "\x0a\x89\x90\x78\x89\x67\x78\x56\x67\x45\x56\x34\x45\x23\x34\x12"
+# next is for test with BLE SPPLIKE can connect but not more
+    #adv_data(5:16) = "\xf9\xb2\x73\xac\xc5\x18\x1f\xab\xe9\x4d\x7f\xe4\x3d\x21\xbd\x9b"
+# next is for test with Blueterm IOS AND ANDROID !!
+	#adv_data(5:16) = "\xFB\x34\x9B\x5F\x80\x00\x00\x80\x00\x10\x00\x00\x01\x11\x00\x00"
+# next is for test with BLUNO IOS
+	#adv_data(5:16) = "\xfb\x34\x9b\x5f\x80\x00\x00\x80\x00\x10\x00\x00\xb0\xdf\x00\x00"
+# next is for test with LINTECH IOS
+	 #adv_data(5:16) = "\x01\xAC\x32\x49\x51\x1A\xAB\xAA\xE3\x11\xDC\xCA\xAE\x63\x8D\xF1"
+# next is for test with HM-10 like
+	 adv_data(5:16) = "\xfb\x34\x9b\x5f\x80\x00\x00\x80\x00\x10\x00\x00\xe0\xff\x00\x00"
+	# next is for test with BLUEFRUIT UART CONNECT
+    #     adv_data(5:16) = "\x9E\xCA\xDC\x24\x0E\xE5\xA9\xE0\x93\xF3\xA3\xB5\x01\x00\x40\x6E"	  
+ 
+    # custom manufacturer data
+    adv_data(21:1) = $06 # ad field length = 6 bytes
+    adv_data(22:1) = $ff # ad field type = 0xFF (Manufacturer Specific Data)
+    adv_data(23:1) = $ff # unknown/prototype Company Identifier Code - octet 2 
+    adv_data(24:1) = $ff # unknown/prototype Company Identifier Code - octet 1 
+    adv_data(25:1) = config_page_1(0:1) # connection key MSB
+    adv_data(26:1) = config_page_1(1:1) # connection key LSB
+    adv_data(27:1) = config_page_1(2:1) # connection channel
+    
+    # -------------------------------
+    # build custom scan response data
+    # -------------------------------
+
+    # tx power field advertisement, iOS apps may need this
+    sr_data(0:1) = $02 # ad field length = 2 bytes
+    sr_data(1:1) = gap_ad_type_txpower  # ad field type = 0x0A (TX Power)
+    sr_data(2:1) = $03 # TX power in dBm
+    # NOTE: TX power is a signed 8-bit value, and is not changed automatically
+    # when using "hardware_set_txpower(<power>)". This may be anywhere from -23
+    # to +3 based on your settings. Negative values may be converted to two's
+    # complement form by adding 256, so for example -23 dBm would be 233 or $E9.
+
+    # device name
+    sr_data(3:1) = 1 + config_page_2(0:1)   # ad field length
+    sr_data(4:1) = gap_ad_type_localname_complete   # ad field type = 0x09 (Complete local name)
+    memcpy(sr_data(5), config_page_2(1), config_page_2(0:1))
+    
+    # write Device Name in GATT
+    call attributes_write(c_device_name, 0, config_page_2(0:1), config_page_2(1:config_page_2(0:1)))
+    
+    # set custom advertisement data (i.e. services and manufacturer data)
+    call gap_set_adv_data(0, 28, adv_data(0:28))
+    
+    # set custom scan response data (i.e. TX power and device name)
+    call gap_set_adv_data(1, 5 + config_page_2(0:1), sr_data(0:5 + config_page_2(0:1)))
+
+    # set scan parameters to according to options, and use passive scanning
+    call gap_set_scan_parameters(config_page_3(2:2), config_page_3(4:2), 0)
+
+    # set advertisement interval to according to options, and use all advertisement channels
+    call gap_set_adv_parameters(config_page_3(6:2), config_page_3(6:2) + $10, 7)
+
+    # set TX power level based on config
+    call hardware_set_txpower(config_page_5(0:1))
+
+    # initialize pseudo-random seed with last two bytes of module serial number
+    call system_reg_read($780e)(i, temp_buf(0:1))
+    call system_reg_read($780f)(i, temp_buf(1:1))
+    rand_factor = temp_buf(0:1) + (temp_buf(1:1) * $ff)
+    				
+    # trigger temperature reading to finish pseudo-random seed initialization
+    # (first activation of master/slave/ping-pong role happens in hardware_adc_result)
+    call hardware_adc_read(14, 3, 0)
+end
+
+# catch scan response event while (if) scanning
+event gap_scan_response(rssi, packet_type, sender, address_type, bond, data_len, data_data)
+    # only check for main ad packets (packet_type = 0)
+    if packet_type = 0 then
+        # advertisement packet found during scan, so check for SPP-over-BLE service
+	# next is from original BLUEGIGA used for XPIT
+###        temp_buf(0:16) = "\xf6\xec\x37\xdb\xbd\xa1\x46\xec\xa4\x3a\x6d\x86\xde\x88\x56\x1d"
+	# next is for test with BLUNO IOS App
+        # temp_buf(0:16) = "\xb2\xdf\x9b\x5f\x80\x00\x00\x80\x00\x10\x00\x00\xb0\xdf\x00\x00"
+	# next is for test with  aircable
+	    #  temp_buf(0:16) = "\x0a\x89\x90\x78\x89\x67\x78\x56\x67\x45\x56\x34\x45\x23\x34\x12"
+
+	# next is for test with BLE SPPLIKE  can connect but not more
+	    #  temp_buf(0:16) = "\xf9\xb2\x73\xac\xc5\x18\x1f\xab\xe9\x4d\x7f\xe4\x3d\x21\xbd\x9b"
+	# next is for test with Blueterm IOS AND ANDROID !!
+		#   temp_buf(0:16) = "\xFB\x34\x9B\x5F\x80\x00\x00\x80\x00\x10\x00\x00\x01\x11\x00\x00"
+	# next is for test with BLUNO IOS
+		#   temp_buf(0:16) = "\xfb\x34\x9b\x5f\x80\x00\x00\x80\x00\x10\x00\x00\xb0\xdf\x00\x00"
+	# next is for test with LINTECH IOS
+		 #  temp_buf(0:16) = "\x01\xAC\x32\x49\x51\x1A\xAB\xAA\xE3\x11\xDC\xCA\xAE\x63\x8D\xF1"
+	# next is for test with HM-10 like
+         temp_buf(0:16) = "\xfb\x34\x9b\x5f\x80\x00\x00\x80\x00\x10\x00\x00\xe0\xff\x00\x00"
+	# next is for test with BLUEFRUIT UART CONNECT
+        # temp_buf(0:16) = "\x9E\xCA\xDC\x24\x0E\xE5\xA9\xE0\x93\xF3\xA3\xB5\x01\x00\x40\x6E"
+		 
+        i = 0
+        while i < data_len
+            #ad_field_length(0:1) = data_data(i:1)
+            #ad_field_type(0:1) = data_data(i + 1:1)
+            if data_data(i + 1:1) = $06 || data_data(i + 1:1) = $07 then
+                # partial ($06) or complete ($07) list of 128-bit UUID
+
+                j = 0
+                while j < data_data(i:1) - 1
+                    if DEBUG_ENABLE = 1 then
+                        # DEBUG
+						# Ver. 1.1.0 next line remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 16, "FOUND SVC UUID: ")
+                        k = 0
+                        while k < 16
+                            temp_buf(16:1) = (data_data(i + j + 2 + k:1)/$10) + 48 + ((data_data(i + j + 2 + k:1)/$10)/10*7)
+                            temp_buf(17:1) = (data_data(i + j + 2 + k:1)&$f)  + 48 + ((data_data(i + j + 2 + k:1)&$f )/10*7)
+                            temp_buf(18:1) = $20
+							# Ver. 1.1.0 next line remarked 
+                            ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(16:3))
+                            k = k + 1
+                        end while
+						# Ver. 1.1.0 next line remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                    end if
+
+                    if memcmp(data_data(i + j + 2), temp_buf(0), 16) then
+                        # found SPP-over-BLE service
+
+                        # print RESP <mac> <address_type> <spp_dev_id> <rssi> event
+						
+						# Ver. 1.1.0 next lines remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 5, "RESP ")
+                        ##call print_hex_bytes(USE_ENDPOINT, ":", 1, 6, sender(0:6))
+                        ##call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                        ##call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, address_type)
+                        ##call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                        ##call print_hex_bytes(USE_ENDPOINT, 0, 0, 3, data_data(i + j + 2 + 20:3))
+                        ##call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                        ##call print_int8(USE_ENDPOINT, rssi)
+                        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                        
+						
+                        # now check for connection key/channel
+                        if (status_flags(1:1) & $01) = 1 && memcmp(data_data(i + j + 2 + 20), config_page_1(0), 3) then
+                            # matching key/channel, so stop scanning/timer and connect
+                            call hardware_set_soft_timer(0, HANDLE_TIMER_PINGPONG, 1)
+                            call gap_end_procedure()
+                            
+                            if DEBUG_ENABLE = 1 then
+                                # DEBUG
+								# Ver. 1.1.0 next line remarked 
+                                ##call system_endpoint_tx(USE_ENDPOINT, 12, "FOUND MATE\r\n")
+                            end if
+
+                            # try to connect with configured parameters
+                            call gap_connect_direct(sender(0:6), address_type, config_page_3(8:2), config_page_3(8:2) + $10, config_page_3(10:2), config_page_3(12:2))(ret_result, k)
+                            
+                            # print CALL <mac> <address_type> event
+							# Ver. 1.1.0 next line remarked 
+                            ##call system_endpoint_tx(USE_ENDPOINT, 5, "CALL ")
+                            ##call print_hex_bytes(USE_ENDPOINT, ":", 1, 6, sender(0:6))
+                            ##call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                            ##call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, address_type)
+                            ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+
+                            if DEBUG_ENABLE = 1 then
+                                # DEBUG
+								
+								# Ver. 1.1.0 next line remarked 
+                                ##call system_endpoint_tx(USE_ENDPOINT, 13, "CONN RESULT: ")
+                                temp_buf(16:1) = ((ret_result >> 12) & $f) + 48 + ((ret_result >> 12) & $f)/10*7
+                                temp_buf(17:1) = ((ret_result >> 8) & $f) + 48 + ((ret_result >> 8) & $f)/10*7
+                                temp_buf(18:1) = ((ret_result >> 4) & $f) + 48 + ((ret_result >> 4) & $f)/10*7
+                                temp_buf(19:1) = (ret_result & $f) + 48 + (ret_result & $f)/10*7
+                                ##call system_endpoint_tx(USE_ENDPOINT, 4, temp_buf(16:4))
+                                ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                            end if
+                            
+                            # start connection timeout detection one-shot timer
+                            call hardware_set_soft_timer(32768 * config_page_3(14:1), HANDLE_TIMER_CONNTIMEOUT, 1)
+                        end if
+                        
+                        # set loop counters to 100 so we'll stop looking
+                        # (there is no "break" function in BGScript)
+                        i = 100
+                        j = 100
+                    end if
+                    j = j + 16
+                end while
+            end if
+            i = i + data_data(i:1) + 1
+        end while
+    end if
+end
+
+# catch connection update event
+event connection_status(connection, flags, address, address_type, conn_interval, timeout, latency, bonding)
+    # check for "new connection established" update
+    if (flags & $05) = $05 then
+        # cancel connection timeout detection one-shot timer if running
+        call hardware_set_soft_timer(0, HANDLE_TIMER_CONNTIMEOUT, 1)
+         
+        # update status
+        if (status_flags(0:1) & (1 << FLAG_IS_CONNECTING)) then
+            status_flags(0:1) = status_flags(0:1) ^ (1 << FLAG_IS_CONNECTING)
+        end if
+            
+        # update status
+        if (status_flags(0:1) & (1 << FLAG_IS_ADVERTISING)) = 0 then
+            if DEBUG_ENABLE = 1 then
+                # DEBUG
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 21, "CONNECTED AS MASTER\r\n")
+            end if
+            
+            # send CONN <mac> <address_type> event
+			
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 5, "CONN ")
+            ##call print_hex_bytes(USE_ENDPOINT, ":", 1, 6, address(0:6))
+            ##call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+            ##call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, address_type)
+            ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+
+            # enable notifications/indications on server/slave
+            if config_page_3(17:1) = 0 then
+                # using acknowledged data transfer (indications)
+                # subscribe by writing 0x0002 to remote client characteristic configuration attribute
+                call attclient_attribute_write(connection, c_spp_data_acknowledged + 1, 2, "\x02\x00")
+            end if
+
+            # device is master, previously scanning
+            status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_CONNECTED) | (1 << FLAG_IS_MASTER)
+            status_flags(0:1) = status_flags(0:1) ^ (1 << FLAG_IS_SCANNING)
+        else
+            if DEBUG_ENABLE = 1 then
+                # DEBUG
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 20, "CONNECTED AS SLAVE\r\n")
+            end if
+
+            # send RING <mac> <address_type> event
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 5, "RING ")
+            ##call print_hex_bytes(USE_ENDPOINT, ":", 1, 6, address(0:6))
+            ##call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+            ##call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, address_type)
+            ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+
+            # cancel ping-pong ad/scan timer if running
+            call hardware_set_soft_timer(0, HANDLE_TIMER_PINGPONG, 1)
+
+            # device is slave, previously advertising
+            status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_CONNECTED)
+            status_flags(0:1) = status_flags(0:1) ^ (1 << FLAG_IS_ADVERTISING)
+        end if
+        #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+    end if
+
+    # check for "encrypted" status update (i.e. paired)
+    if (flags & $02) = $02 then
+        # send ENCRYPT event if not in data mode
+        if (status_flags(0:1) & (1 << FLAG_IS_DATAMODE)) = 0 then
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 9, "ENCRYPT\r\n")
+        end if
+
+        # update status
+        status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_ENCRYPTED)
+        #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+    end if
+end
+
+# catch disconnection event
+event connection_disconnected(handle, result)
+    # update status (disable everything)
+    status_flags(0:1) = 0
+    #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+
+    # send DISC <result> event
+	# Ver. 1.1.0 next line remarked 
+    ##call system_endpoint_tx(USE_ENDPOINT, 5, "DISC ")
+    ##call print_hex_bytes(USE_ENDPOINT, 0, 1, 2, result)
+    ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+    
+    # enable RX watermarks only (for processing commands)
+    call system_endpoint_set_watermarks(USE_ENDPOINT, 1, 0)
+    
+    if DEBUG_ENABLE = 1 then
+        # DEBUG
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 21, "WATERMARKS DISABLED\r\n")
+    end if
+
+    # XPIT: restart slave_role => advertising
+	call start_spp_role(BLEROLE_SLAVE)
+	
+#    # restart auto-connection if we just came out of ping-pong mode
+#    if status_flags(1:1) & $02 then
+#        call start_spp_role(BLEROLE_PINGPONG)
+#    else
+#        if status_flags(1:1) & $01 && config_page_3(0:1) = BLEROLE_MASTER then
+#            call start_spp_role(BLEROLE_MASTER)
+#        end if
+#    end if
+
+end
+
+event sm_bonding_fail(handle, result)
+    # send ERR9 <result> event if not in datamode
+    if (status_flags(0:1) & (1 << FLAG_IS_DATAMODE)) = 0 then
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 5, "ERR9 ")
+        ##call print_hex_bytes(USE_ENDPOINT, 0, 1, 2, result)
+        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+    end if
+end
+
+# catch timer tick (used for master/slave ping-pong and other things)
+event hardware_soft_timer(handle)
+    # check for master/slave ping-pong timer
+    if handle = HANDLE_TIMER_PINGPONG && (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) = 0 then
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 18, "TIMER: PING-PONG\r\n")
+        end if
+        
+        if (status_flags(0:1) & (1 << FLAG_IS_ADVERTISING)) > 0 then
+            # currently advertising, so stop and start scanning
+            call gap_set_mode(0, 0)
+
+            # update status
+            status_flags(0:1) = status_flags(0:1) ^ ((1 << FLAG_IS_SCANNING) | (1 << FLAG_IS_ADVERTISING))
+            #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+            
+            # send SCAN event
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 6, "SCAN\r\n")
+
+            # start discovery
+            call gap_discover(gap_discover_generic)
+
+            # restart ad/scan ping-pong one-shot using scan duration
+            call hardware_set_soft_timer(pp_time_scanning, HANDLE_TIMER_PINGPONG, 1)
+        else
+            # currently scanning, so stop and start advertising
+            call gap_end_procedure()
+
+            # update status
+            status_flags(0:1) = status_flags(0:1) ^ ((1 << FLAG_IS_SCANNING) | (1 << FLAG_IS_ADVERTISING))
+            #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+
+            # send ADV event
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 5, "ADV\r\n")
+
+            # put module into discoverable/connectable mode (with user-defined advertisement data)
+            call gap_set_mode(gap_user_data, gap_undirected_connectable)
+
+            # restart ad/scan ping-pong one-shot using ad duration
+            call hardware_set_soft_timer(pp_time_advertising, HANDLE_TIMER_PINGPONG, 1)
+        end if
+    end if
+    
+    # check for connection attempt timeout timer
+    if handle = HANDLE_TIMER_CONNTIMEOUT && (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) = 0 then
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 21, "TIMER: CONN TIMEOUT\r\n")
+        end if
+        
+        if (status_flags(0:1) & (1 << FLAG_IS_CONNECTING)) then
+			# cancel pending connection attempt
+			call gap_end_procedure()		# required
+			call connection_disconnect(0)	# failsafe
+
+            # update status
+            status_flags(0:1) = status_flags(0:1) ^ ((1 << FLAG_IS_CONNECTING) | (1 << FLAG_IS_MASTER))
+            #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+            
+            # send NORX event
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 6, "NORX\r\n")
+        end if
+
+        # oops, we're still not connected, so retry if ping-pong mode is enabled
+        if status_flags(1:1) = 3 then
+            call start_spp_role(BLEROLE_PINGPONG)
+        else
+            if status_flags(1:1) & $01 && config_page_3(0:1) = BLEROLE_MASTER then
+                call start_spp_role(BLEROLE_MASTER)
+            end if
+        end if
+    end if
+	
+	# start EXPLORE-IT 
+	
+#	if handle = 11 then
+#		call system_endpoint_tx(USE_ENDPOINT, 14, "ST_handle_11\r\n")		
+#	end if
+		
+	if ROB_STATE = 2 then					# from the LEARN Command ; this is the 1of 2 triggers per sample
+		call hardware_adc_read(0,3,2) 		#startet conversion: AD0 = P0.0 
+#		call hardware_adc_read(6,3,2) 		#startet conversion: CH6 = Poti; 3=12 bit result always in MSB bits; 0:reference int: 1.24V
+											#																	 2:reference AVDD PIN
+											# result comes with event hardware_adc_result(input, value)  ca. line 2034
+											# start conversion second channel is triggered later AFTER READING first channel
+	end if
+
+#	if ROB_STATE = 4 then					# from the G continous adc6 Command for tests only
+#		call hardware_adc_read(6,3,2) 		#startet conversion: CH6 = Poti; 3=12 bit result always in MSB bits; 0:reference int: 1.24V
+#	end if
+	
+	
+	if ROB_STATE=4 then     # do PWM started with Command "G"
+		if ROB_count > ROB_MAX_FLASH then
+			call hardware_timer_comparator(1, 0, 6, 0)
+			call hardware_timer_comparator(1, 1, 6, 32000)
+			call hardware_timer_comparator(1, 2, 6, 32000)
+
+			# stop LED with GPIO = high; all pin GPIO from now
+			call hardware_io_port_config_function(1, $00)
+			call hardware_io_port_write(1, $07, $07) # 
+
+			temp_buf(0:4) = "_END"
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))	
+			ROB_STATE = 3						# still full=ready for re-run 
+			call hardware_set_soft_timer(0, 11, 0)
+			
+			# new with VER = 002: Set P0_4 and P0_5 both pins LOW
+			# (port=0, pin selection mask = 0b00110000, pin logic mask = 0b00000000)
+			call hardware_io_port_write(0, $30, $00)
+		else
+			call flash_read_data(ROB_count, 1)(ret_value_len, temp_buf(9:1))
+			call flash_read_data(ROB_count+1, 1)(ret_value_len, temp_buf(10:1))
+
+			call hardware_timer_comparator(1, 0, 6, 32000)
+
+			# XPIT added 30.3.2018: variable factor controllable through command "Cxx"
+			# Factor 127 is perfect for reproduction of DC Value
+			# reminder: we have max ref of 32000;  127*255==32385!!
+			# higher speed happens to be a lower number
+			
+			#following ok with VER1:
+			# temp_buf(19) = (255 - temp_buf(9:1)) * (137 - ROB_LEFT_CORR)
+			# temp_buf(25) = (255 - temp_buf(10:1)) * (137 - ROB_RIGHT_CORR)
+			
+			##			temp_buf(19) = (255 - temp_buf(9:1)) * ROB_SPEED_CALIB
+			##			temp_buf(25) = (255 - temp_buf(10:1)) * ROB_SPEED_CALIB			
+			# VER = 002	: no leftright speed calibration anymore
+			####	temp_buf(19) = (255 - temp_buf(9:1)) * (127)
+			####	temp_buf(25) = (255 - temp_buf(10:1)) * (127)
+			
+#VER_0042
+			PWM_L = (255 - temp_buf(9:1)) * (127)
+			PWM_R = (255 - temp_buf(10:1)) * (127)
+
+			# original code;  we use TIMER1 ALTERNATE 2;
+####			call hardware_timer_comparator(1, 2, 6, temp_buf(19))			# CH2 at P1.0 is left channel
+####			call hardware_timer_comparator(1, 1, 6, temp_buf(25))			# CH1 at P1.1 is right channel
+			call hardware_timer_comparator(1, 2, 6, PWM_L)			# CH2 at P1.0 is left channel
+			call hardware_timer_comparator(1, 1, 6, PWM_R)			# CH1 at P1.1 is right channel
+
+			# new with VER = 002 : Set P0_4 and P0_5 according direction  
+			# untested! specifically check L/R setting; low or high active LED ?
+			# (port=0, pin selection mask = 0b00110000, pin logic mask = 0b00210000)
+####			if temp_buf(19) > temp_buf(25) then
+			if PWM_L > PWM_R then
+				call hardware_io_port_write(0, $30, $10)
+			else
+				call hardware_io_port_write(0, $30, $20)			
+			end if
+					
+			ROB_count=ROB_count+2
+		end if
+	end if
+
+	if ROB_STATE = 5 then								# VER_006 uses: ROB_paket_counter
+														# check ROB_MAX_FLASH to set ROB_STATE = 1 at end of transmission
+		# MARK_LED 
+		call hardware_io_port_write(0, $30, $30)
+	
+		if ROB_count > ROB_MAX_FLASH then				# send end character of B-Command
+
+# Following removed with VER_006, no longer needed
+#			temp_buf(0:2) = ",,"
+#			call attributes_write(c_spp_data_acknowledged, 0, 2, temp_buf(0:2))	
+
+			ROB_STATE = 1								# still full=ready for run 
+			call hardware_set_soft_timer(0, 11, 0)
+			
+			# MARK_LED 
+			call hardware_io_port_write(0, $30, $00)
+		
+		else
+			temp_buf(0:1) = ROB_paket_counter			# first Byte is sequence counter
+			ROB_paket_counter = ROB_paket_counter + 1	# increment it for next transmission
+			while ((ROB_count <= ROB_MAX_FLASH) && (i<19) )
+				call flash_read_data(ROB_count, 1)(ret_value_len, temp_buf(i:1))
+				ROB_count=ROB_count+1	
+				i=i+1
+			end while			
+			call attributes_write(c_spp_data_acknowledged, 0, i, temp_buf(0:i))
+			i=1
+		end if
+		
+			# MARK_LED 
+			call hardware_io_port_write(0, $30, $00)
+		
+	end if
+	
+	# End EXPLORE-IT
+end
+
+# catch status update so we know when the other client is connected + subscribed
+event attributes_status(handle, flags)
+    if ( (handle = c_spp_data_acknowledged) && (flags = 2) ) then		#VER_004
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 19, "IND/NOTIF ENABLED\r\n")
+        end if
+        
+        # enable RX watermark
+        call system_endpoint_set_watermarks(USE_ENDPOINT, config_page_4(0:1), $ff)
+        
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 23, "RX WATERMARKS ENABLED\r\n")
+        end if
+        
+        # send DATA event
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "DATA\r\n")
+
+        # update status
+        status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_DATAMODE)
+        #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+    else
+        if ( (handle = c_spp_data_acknowledged) && (flags != 2) ) then		#VER_004
+            # update status (clear datamode)
+            if (status_flags(0:1) & (1 << FLAG_IS_DATAMODE)) then
+                # update status
+                status_flags(0:1) = status_flags(0:1) ^ (1 << FLAG_IS_DATAMODE)
+                #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+
+                # send READY event
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 7, "READY\r\n")
+            end if
+        end if
+    end if
+end
+
+# catch RX watermark event (i.e. there is data available)
+event system_endpoint_watermark_rx(endpoint, size)
+    # disable RX watermark (re-enabled later, after reading endpoint or packet acknowledgement)
+    call system_endpoint_set_watermarks(USE_ENDPOINT, 0, $ff)
+    
+    in_len = size
+    if in_len > 20 then
+       in_len = 20
+    end if
+    
+    #if DEBUG_ENABLE = 1 then
+        # DEBUG
+        #call system_endpoint_tx(USE_ENDPOINT, 4, "RX: ")
+        #temp_buf(0:1) = (in_len/$10) + 48 + ((in_len/$10)/10*7)
+        #temp_buf(1:1) = (in_len&$f)  + 48 + ((in_len&$f )/10*7)
+        #call system_endpoint_tx(USE_ENDPOINT, 2, temp_buf(0:2))
+        #call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+    #end if
+
+    if (status_flags(0:1) & (1 << FLAG_IS_DATAMODE)) > 0 then
+        if config_page_3(17:1) = 0 then
+            # using acknowledged data transfer (indications)
+            
+            if DEBUG_ENABLE = 1 then
+                # DEBUG
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 24, "RX WATERMARKS DISABLED\r\n")
+            end if
+
+            # read data from endpoint
+            call system_endpoint_rx(USE_ENDPOINT, in_len)(ret_result, in_len, in(0:in_len))
+
+            # check if master or slave and respond appropriately
+            if (status_flags(0:1) & (1 << FLAG_IS_MASTER)) = 0 then
+                # this device is the slave
+                # write data to local attribute (push to remote via indications)
+                call attributes_write(c_spp_data_acknowledged, 0, in_len, in(0:in_len))
+            else
+                # this device is the master
+                # write data to remote attribute with acknowledgement
+                call attclient_attribute_write(0, c_spp_data_acknowledged, in_len, in(0:in_len))
+            end if
+
+    else
+        # read data from endpoint
+        call system_endpoint_rx(USE_ENDPOINT, in_len)(ret_result, in_len, in(0:in_len))
+        
+        # enable RX watermark
+        call system_endpoint_set_watermarks(USE_ENDPOINT, 1, $ff)
+        
+        # local echo if in command mode
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, in_len, in(0:in_len))
+
+        # process as command
+        i = 0
+        while i < in_len
+            if in(i:1) = $0a || in(i:1) = $0d then
+                # end of command
+                
+                # AT - test communication
+                # ATA - advertise (wait for connection and answer when received)
+                # ATC <X> [Y [value]] - Read config page <X> entry <Y> (or write if [value] present)
+                # ATD [aabbccddeeff] [type] - connect to any matching device [or to mac address]
+                # ATE - encrypt link
+                # ATF - reset to default settings
+                # ATH - hang up (close connection, cancel scanning / advertising / ping-pong)
+                # ATL - get link status
+                # ATM - get local MAC address
+                # ATP - enter ping-pong mode (scan/advertise until connected)
+                # ATS - scan (show connectable devices)
+                # ATV - get SPP-over-BLE firmware version
+                # ATW - write config to flash
+                # ATY - reset into DFU mode
+                # ATZ - reset device (normal reboot)
+                
+                if cmd_buf_len > 0 then
+                    k = 1
+                    if cmd_buf_len = 2 && cmd_buf(0:2) = "AT" then
+                        # Verify connectivity is okay
+                        k = 0
+						# Ver. 1.1.0 next line remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                    end if
+                    if cmd_buf_len = 3 then
+                        # ATA, ATD, ATE, ATF, ATH, ATL, ATM, ATP, ATS, ATV, ATW, ATY, ATZ
+                        if cmd_buf(0:3) = "ATA" then
+                            # Start advertising (listen for incoming connection requests)
+                            #
+                            # Generates ERR2 (bad state) if currently connected.
+                            if (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) then
+                                k = 2
+                            else
+                                k = 0
+                                call hardware_set_soft_timer(0, HANDLE_TIMER_PINGPONG, 1)
+								# Ver. 1.1.0 next line remarked 
+                                ##call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                                call gap_end_procedure()
+                                call gap_set_mode(0, 0)
+                                status_flags(0:1) = 0 # disable all flags (PORT1 written in start_spp_role)
+                                status_flags(1:1) = 0 # auto-connect disabled (only for outgoing connections)
+                                call start_spp_role(BLEROLE_SLAVE)
+                            end if
+                        end if
+                        if cmd_buf(0:3) = "ATD" then
+                            # Connect to any visible matching remote SPP-over-BLE device
+                            # Searches for connectable SPP-over-BLE remote devices which match
+                            # the device ID/key values of this device, and automatically connects
+                            # to the first one seen. Like ping-pong mode, but only scans without
+                            # swapping back and forth with advertising.
+                            #
+                            # Generates ERR2 (bad state) if currently connected, connecting,
+                            # scanning, or advertising.
+                            if status_flags(0:1) > 0 then
+                                k = 2
+                            else
+                                k = 0
+								# Ver. 1.1.0 next line remarked
+                                ##call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                                call hardware_set_soft_timer(0, HANDLE_TIMER_PINGPONG, 1)
+                                call gap_end_procedure()
+                                call gap_set_mode(0, 0)
+                                status_flags(0:1) = 0 # disable all flags (PORT1 written in start_spp_role)
+                                status_flags(1:1) = 1 # auto-connect enabled
+                                call start_spp_role(BLEROLE_MASTER)
+                            end if
+                        end if
+                        if cmd_buf(0:3) = "ATE" then
+                            # Encrypt connection
+                            # Enable encryption (without bonding) on active connection. This
+                            # will generate an "ENCRYPT" event on both devices (only visible
+                            # if not in DATA mode, or ERR9 <result> if the encryption fails.
+                            #
+                            # Generates ERR2 (bad state) if not currently connected or already
+                            # encrypted.
+                            if (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) = 0 || (status_flags(0:1) & (1 << FLAG_IS_ENCRYPTED)) > 0 then
+                                k = 2
+                            else
+                                k = 0
+								# Ver. 1.1.0 next line remarked
+                                ##call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                                call sm_encrypt_start(0, 0)
+                            end if
+                        end if
+                        if cmd_buf(0:3) = "ATF" then
+                            # send RESET event
+							# Ver. 1.1.0 next line remarked
+                            ##call system_endpoint_tx(USE_ENDPOINT, 13, "\r\nOK\r\nRESET\r\n")
+                            
+                            # mark settings as uninitialized and reboot
+                            temp_buf(0:1) = $00
+                            call flash_ps_save($8000, 1, temp_buf(0:1))
+                            call system_reset(0)
+                        end if
+                        if cmd_buf(0:3) = "ATH" then
+                            # Close/cancel connection, stop scanning, stop advertising, stop ping-pong
+                            # This command will end whatever is going on and return to a state
+                            # where the device is ready for further AT commands.
+                            #
+                            # Generates ERR2 (bad state) if not currently doing anything.
+                            if status_flags(0:1) = 0 then
+                                k = 2
+                            else
+                                k = 0
+								# Ver. 1.1.0 next line remarked
+                                ##call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                                call hardware_set_soft_timer(0, HANDLE_TIMER_PINGPONG, 1)
+                                call hardware_set_soft_timer(0, HANDLE_TIMER_CONNTIMEOUT, 1)
+                                call connection_disconnect()
+                                call gap_end_procedure()
+                                call gap_set_mode(0, 0)
+
+                                # update status
+                                status_flags(0:1) = 0 # disable all flags
+                                status_flags(1:1) = 0 # auto-connect disabled
+                                #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+                            end if
+                        end if
+                        if cmd_buf(0:3) = "ATL" then
+                            # Show link status
+                            # Generates "STAT <status>" event, with bits set accordingly:
+                            # (Note big-endian byte ordering)
+                            #
+                            # -- BYTE 1 (internal) --
+                            #   bit 0: auto-connect in scan mode
+                            # -- BYTE 0 (written as [PORT1 & 0x7F] output) --
+                            #   bit 0: is advertising
+                            #   bit 1: is scanning
+                            #   bit 2: is connecting (connection pending)
+                            #   bit 3: is connected
+                            #   bit 4: is encrypted
+                            #   bit 5: is master
+                            #   bit 6: is in data mode
+                            k = 0
+							# Ver. 1.1.0 next line remarked
+                            ##call system_endpoint_tx(USE_ENDPOINT, 11, "\r\nOK\r\nLINK ")
+                            ##call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, status_flags(0:2))
+                            # Ver. 1.1.0 next line remarked
+							##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                        end if
+                        if cmd_buf(0:3) = "ATM" then
+                            # Display local MAC address
+                            # Outputs the MAC event in AA:BB:CC:DD:EE:FF format
+                            k = 0
+							# Ver. 1.1.0 next line remarked
+                            ##call system_endpoint_tx(USE_ENDPOINT, 10, "\r\nOK\r\nMAC ")
+                            call system_address_get()(temp_buf(0:6))
+							# Ver. 1.1.0 next line remarked
+                            ##call print_hex_bytes(USE_ENDPOINT, ":", 1, 6, temp_buf(0:6))
+                            # Ver. 1.1.0 next line remarked
+							##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                        end if
+                        if cmd_buf(0:3) = "ATP" then
+                            # Enter ping-pong autoconnect mode
+                            # Searches for connectable SPP-over-BLE remote devices which match
+                            # the device ID/key values of this device, and automatically connects
+                            # to the first one seen.
+                            #
+                            # Generates ERR2 (bad state) if currently connected.
+                            if (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) then
+                                k = 2
+                            else
+                                k = 0
+								# Ver. 1.1.0 next line remarked                               
+							   ##call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                                call hardware_set_soft_timer(0, HANDLE_TIMER_PINGPONG, 1)
+                                call gap_end_procedure()
+                                call gap_set_mode(0, 0)
+                                status_flags(0:1) = 0 # disable all flags (PORT1 written in start_spp_role)
+                                status_flags(1:1) = 3 # auto-connect enabled, ping-pong mode enabled
+                                call start_spp_role(BLEROLE_PINGPONG)
+                            end if
+                        end if
+                        if cmd_buf(0:3) = "ATS" then
+                            # Scan for devices
+                            # Generates "RESP" events for connectable SPP-over-BLE remote devices.
+                            # Terminate the process using "ATH", or issue "ATA", "ATD", or "ATP"
+                            # commands to stop scanning and jump into advertisement, call, or
+                            # ping-pong autoconnect mode.
+                            #
+                            # Generates ERR2 (bad state) if currently connected.
+                            if (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) then
+                                k = 2
+                            else
+                                k = 0
+								# Ver. 1.1.0 next line remarked
+                                ##call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                                call gap_end_procedure()
+                                call gap_set_mode(0, 0)
+                                status_flags(0:1) = 0 # disable all flags (PORT1 written in start_spp_role)
+                                status_flags(1:1) = 0 # auto-connect disabled
+                                call start_spp_role(BLEROLE_MASTER)
+                            end if
+                        end if
+                        if cmd_buf(0:3) = "ATV" then
+                            # Display SPP-over-BLE firmware version
+                            # Outputs the VER event with a Major.Minor.Patch.Variant number (i.e. 1.0.0.1)
+                            k = 0
+							call system_endpoint_tx(USE_ENDPOINT, 19, "\r\nOK\r\nVER 1.2.0.1\r\n")
+                        end if
+                        if cmd_buf(0:3) = "ATW" then
+                            # Write all configuration to flash
+                            # Current state does not matter. Will take effect immediately. This
+                            # does not change any active configuration settings, but only writes
+                            # the ones which are currently active.
+                            k = 0
+                            call system_endpoint_tx(USE_ENDPOINT, 6, "\r\nOK\r\n")
+                            call flash_ps_save($8001, 3, config_page_1(0:3))
+                            call flash_ps_save($8002, 17, config_page_2(0:17))
+                            call flash_ps_save($8003, 18, config_page_3(0:18))
+                            call flash_ps_save($8004, 5, config_page_4(0:5))
+                            call flash_ps_save($8005, 2, config_page_5(0:2))
+                            call system_endpoint_tx(USE_ENDPOINT, 7, "SAVED\r\n")
+                        end if
+                        if cmd_buf(0:3) = "ATY" then
+                            # Reset into DFU mode
+                            # Current state does not matter. Will take effect immediately.
+                            call system_endpoint_tx(USE_ENDPOINT, 11, "\r\nOK\r\nDFU\r\n")
+                            call system_reg_read($70fc) # dummy command to allow UART TX to finish
+                            call system_reg_read($70fc) # dummy command to allow UART TX to finish
+                            call system_reset(1)
+                        end if
+                        if cmd_buf(0:3) = "ATZ" then
+                            # Reset device
+                            # Current state does not matter. Will take effect immediately.
+                            # When using the USB interface, the device will momentarily
+                            # disconnect and then re-enumerate.
+                            call system_endpoint_tx(USE_ENDPOINT, 13, "\r\nOK\r\nRESET\r\n")
+                            call system_reg_read($70fc) # dummy command to allow UART TX to finish
+                            call system_reg_read($70fc) # dummy command to allow UART TX to finish
+                            call system_reset(0)
+                        end if
+                    end if
+                    if cmd_buf_len > 4 then
+                        if cmd_buf(0:4) = "ATC " then
+                            k = 3
+                            if cmd_buf_len = 6 then
+                                # ATC <page> - print config page
+                                call parse_hexbyte_to_temp_buf(cmd_buf(4:2))
+                                if temp_buf(0:1) > 0 && temp_buf(0:1) < 6 then
+                                    k = 0
+                                    call system_endpoint_tx(USE_ENDPOINT, 11, "\r\nOK\r\nCFGP ")
+                                    call system_endpoint_tx(USE_ENDPOINT, 2, cmd_buf(4:2))
+                                    call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                                    if temp_buf(0:1) = 1 then
+                                        call print_hex_bytes(USE_ENDPOINT, 0, 0, 3, config_page_1(0:3))
+                                    end if
+                                    if temp_buf(0:1) = 2 then
+                                        call print_hex_bytes(USE_ENDPOINT, 0, 0, 17, config_page_2(0:17))
+                                    end if
+                                    if temp_buf(0:1) = 3 then
+                                        call print_hex_bytes(USE_ENDPOINT, 0, 0, 18, config_page_3(0:18))
+                                    end if
+                                    if temp_buf(0:1) = 4 then
+                                        call print_hex_bytes(USE_ENDPOINT, 0, 0, 5, config_page_4(0:5))
+                                    end if
+                                    if temp_buf(0:1) = 5 then
+                                        call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_5(0:2))
+                                    end if
+                                    call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                                end if
+                            end if
+                            if cmd_buf_len >= 9 then
+                                # ATC <page> <entry> [value] - print/update config page single entry
+                                call parse_hexbyte_to_temp_buf(cmd_buf(7:2))
+                                temp_buf(31:1) = temp_buf(0:1) # store <entry> value in last temp_buf byte
+                                call parse_hexbyte_to_temp_buf(cmd_buf(4:2))
+                                if temp_buf(0:1) > 0 && temp_buf(0:1) < 6 then
+                                    k = 4
+                                    if cmd_buf_len = 9 then
+                                        call system_endpoint_tx(USE_ENDPOINT, 11, "\r\nOK\r\nCFGV ")
+                                        call system_endpoint_tx(USE_ENDPOINT, 2, cmd_buf(4:2))
+                                        call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                                        call system_endpoint_tx(USE_ENDPOINT, 2, cmd_buf(7:2))
+                                        call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                                    end if
+                                    if temp_buf(0:1) = 1 then
+                                        # CONFIG PAGE 1
+                                        if temp_buf(31:1) = 1 then
+                                            # CONNECTION KEY/CHANNEL (01/01)
+                                            if cmd_buf_len = 9 then
+                                                # read 01/01
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 3, config_page_1(0:3))
+                                            end if
+                                            if cmd_buf_len = 16 then
+                                                # write 01/01 (3 bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_1(0:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_1(1:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(14:2))
+                                                config_page_1(2:1) = temp_buf(0:1)
+
+                                                adv_data(25:1) = config_page_1(0:1) # connection key MSB
+                                                adv_data(26:1) = config_page_1(1:1) # connection key LSB
+                                                adv_data(27:1) = config_page_1(2:1) # connection channel
+
+                                                # set custom advertisement data (i.e. services and manufacturer data)
+                                                call gap_set_adv_data(0, 28, adv_data(0:28))
+                                            end if
+                                        end if
+                                    end if
+                                    if temp_buf(0:1) = 2 then
+                                        # CONFIG PAGE 2
+                                        if temp_buf(31:1) = 1 then
+                                            # DEVICE NAME (02/01)
+                                            if cmd_buf_len = 9 then
+                                                # read 02/01 (ASCII VALUE)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, config_page_2(0:1), config_page_2(1:config_page_2(0:1)))
+                                            end if
+                                            if cmd_buf_len > 10 && cmd_buf_len < 27 then
+                                                # write 02/01 (ASCII VALUE, <n> bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                config_page_2(0:1) = cmd_buf_len - 10
+                                                memset(config_page_2(1), 0, 16)
+                                                memcpy(config_page_2(1), cmd_buf(10), config_page_2(0:1))
+
+                                                # write Device Name in GATT
+                                                call attributes_write(c_device_name, 0, config_page_2(0:1), config_page_2(1:config_page_2(0:1)))
+                                            end if
+                                        end if
+                                    end if
+                                    if temp_buf(0:1) = 3 then
+                                        # CONFIG PAGE 3
+                                        if temp_buf(31:1) = 1 then
+                                            # DEFAULT ROLE (03/01)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/01
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, config_page_3(0:1))
+                                            end if
+                                            if cmd_buf_len = 12 then
+                                                # write 03/01 (1 byte)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(0:1) = temp_buf(0:1)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 2 then
+                                            # PING-PONG TIME LOOP (03/02)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/02
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, config_page_3(1:1))
+                                            end if
+                                            if cmd_buf_len = 12 then
+                                                # write 03/02 (1 byte)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(1:1) = temp_buf(0:1)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 3 then
+                                            # SCAN INTERVAL (03/03)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/03
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_3(2:2))
+                                            end if
+                                            if cmd_buf_len = 14 then
+                                                # write 03/03 (2 bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(2:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_3(3:1) = temp_buf(0:1)
+
+                                                # set scan parameters to according to options, and use passive scanning
+                                                call gap_set_scan_parameters(config_page_3(2:2), config_page_3(4:2), 0)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 4 then
+                                            # SCAN WINDOW (03/04)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/04
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_3(4:2))
+                                            end if
+                                            if cmd_buf_len = 14 then
+                                                # write 03/04 (2 bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(4:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_3(5:1) = temp_buf(0:1)
+
+                                                # set scan parameters to according to options, and use passive scanning
+                                                call gap_set_scan_parameters(config_page_3(2:2), config_page_3(4:2), 0)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 5 then
+                                            # ADVERTISEMENT INTERVAL (03/05)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/05
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_3(6:2))
+                                            end if
+                                            if cmd_buf_len = 14 then
+                                                # write 03/05 (2 bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(6:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_3(7:1) = temp_buf(0:1)
+
+                                                # set advertisement interval to according to options, and use all advertisement channels
+                                                call gap_set_adv_parameters(config_page_3(6:2), config_page_3(6:2) + $10, 7)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 6 then
+                                            # CONNECTION INTERVAL (03/06)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/06
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_3(8:2))
+                                            end if
+                                            if cmd_buf_len = 14 then
+                                                # write 03/06 (2 bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(8:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_3(9:1) = temp_buf(0:1)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 7 then
+                                            # SUPERVISION TIMEOUT (03/07)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/07
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_3(10:2))
+                                            end if
+                                            if cmd_buf_len = 14 then
+                                                # write 03/07 (2 bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(10:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_3(11:1) = temp_buf(0:1)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 8 then
+                                            # SLAVE LATENCY (03/08)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/08
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_3(12:2))
+                                            end if
+                                            if cmd_buf_len = 14 then
+                                                # write 03/08 (2 bytes)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(12:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_3(13:1) = temp_buf(0:1)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 9 then
+                                            # CONNECTION ATTEMPT TIMEOUT (03/09)
+                                            if cmd_buf_len = 9 then
+                                                # read 03/09
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, config_page_3(14:1))
+                                            end if
+                                            if cmd_buf_len = 12 then
+                                                # write 03/09 (1 byte)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_3(14:1) = temp_buf(0:1)
+                                            end if
+                                        end if
+                                    end if
+                                    if temp_buf(0:1) = 4 then
+                                        # CONFIG PAGE 4
+                                        if temp_buf(31:1) = 1 then
+                                            # OUTGOING DATA WATERMARK (04/01)
+                                            if cmd_buf_len = 9 then
+                                                # read 04/01
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, config_page_4(0:1))
+                                            end if
+                                            if cmd_buf_len = 12 then
+                                                # write 04/01 (1 byte)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_4(0:1) = temp_buf(0:1)
+                                            end if
+                                        end if
+                                        if temp_buf(31:1) = 2 then
+                                            # BAUD RATE (04/02)
+                                            if cmd_buf_len = 9 then
+                                                # read 04/02
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 2, config_page_4(1:2))
+                                            end if
+                                            if cmd_buf_len = 14 then
+                                                # write 04/02 (2 bytes)
+                                                k = 0
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_4(1:1) = temp_buf(0:1)
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(12:2))
+                                                config_page_4(2:1) = temp_buf(0:1)
+
+                                                # apply baud rate settings (USART1)
+                                                call system_reg_write($70fa, config_page_4(1:1))    # mantissa, BAUD_M
+                                                call system_reg_write($70fc, config_page_4(2:1))    # exponent, BAUD_E 
+
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                            end if
+                                        end if
+                                    end if
+                                    if temp_buf(0:1) = 5 then
+                                        # CONFIG PAGE 5
+                                        if temp_buf(31:1) = 1 then
+                                            # TX POWER (05/01)
+                                            if cmd_buf_len = 9 then
+                                                # read 05/01
+                                                k = 0
+                                                call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, config_page_5(0:1))
+                                            end if
+                                            if cmd_buf_len = 12 then
+                                                # write 05/01 (1 byte)
+                                                k = 0
+                                                call system_endpoint_tx(USE_ENDPOINT, 4, "\r\nOK")
+                                                call parse_hexbyte_to_temp_buf(cmd_buf(10:2))
+                                                config_page_5(0:1) = temp_buf(0:1)
+
+                                                # update TX power level based on config
+                                                call hardware_set_txpower(config_page_5(0:1))
+                                            end if
+                                        end if
+                                    end if
+                                    if k = 0 then
+                                        # ERRn below will have its own preceding "\r\n"
+                                        call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                                    end if
+                                end if
+                            end if
+                        end if
+                        if cmd_buf(0:4) = "ATD " then
+                            k = 3
+                            # Generates ERR2 (bad state) if currently connected, connecting,
+                            # scanning, or advertising.
+                            if status_flags(0:1) > 0 then
+                                k = 2
+                            else
+                                if cmd_buf_len = 16 || cmd_buf_len = 19 then
+                                    # ATD 001122334455 [address_type]
+                                    k = 0
+                                    j = 0
+                                    while j < 6
+                                        call parse_hexbyte_to_temp_buf(cmd_buf(14 - (j * 2):2))
+                                        temp_buf(j + 1:1) = temp_buf(0:1)
+                                        j = j + 1
+                                    end while
+                                    j = 0 # used as address_type value in gap_connect_direct()
+                                    if cmd_buf_len = 19 then
+                                        call parse_hexbyte_to_temp_buf(cmd_buf(17:2))
+                                        if temp_buf(0:1) = $01 then
+                                            j = 1
+                                        end if
+                                    end if
+                                end if
+                                if cmd_buf_len = 21 || cmd_buf_len = 24 then
+                                    # ATD 00:11:22:33:44:55 [address_type]
+                                    k = 0
+                                    j = 0
+                                    while j < 6
+                                        call parse_hexbyte_to_temp_buf(cmd_buf(19 - (j * 3):2))
+                                        temp_buf(j + 1:1) = temp_buf(0:1)
+                                        j = j + 1
+                                    end while
+                                    j = 0 # used as address_type value in gap_connect_direct()
+                                    if cmd_buf_len = 24 then
+                                        call parse_hexbyte_to_temp_buf(cmd_buf(22:2))
+                                        if temp_buf(0:1) = $01 then
+                                            j = 1
+                                        end if
+                                    end if
+                                end if
+                            end if
+
+                            if k = 0 then
+                                # try to connect with configured parameters
+                                call gap_connect_direct(temp_buf(1:6), j, config_page_3(8:2), config_page_3(8:2) + $10, config_page_3(10:2), config_page_3(12:2))(ret_result, ret_result)
+                                
+                                # update status (set master + connecting)
+                                status_flags(0:1) = (1 << FLAG_IS_MASTER) | (1 << FLAG_IS_CONNECTING)
+                                #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+
+                                # make sure that if we time out, we don't re-enter ping-pong mode
+                                status_flags(1:1) = 0 # auto-connect disabled, ping-pong mode disabled
+
+                                # print CALL <mac> <address_type> event
+								# Ver. 1.1.0 next line remarked 
+                                ##call system_endpoint_tx(USE_ENDPOINT, 11, "\r\nOK\r\nCALL ")
+                                call print_hex_bytes(USE_ENDPOINT, ":", 1, 6, temp_buf(1:6))
+                                ##call system_endpoint_tx(USE_ENDPOINT, 1, " ")
+                                ##call print_hex_bytes(USE_ENDPOINT, 0, 0, 1, j)
+                                ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+
+                                # start connection timeout detection one-shot timer
+                                call hardware_set_soft_timer(32768 * config_page_3(14:1), HANDLE_TIMER_CONNTIMEOUT, 1)
+                            end if
+                        end if
+                    end if
+                    
+                    # send ERRn response to finish if necessary
+                    if k != 0 then
+						# Ver. 1.1.0 next line remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 5, "\r\nERR")
+                        ##call system_endpoint_tx(USE_ENDPOINT, 1, k + $30)
+                        ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                    end if
+                    
+                    # reset incoming command buffer position
+                    cmd_buf_len = 0
+                end if
+            else
+                if in(i:1) = $08 || in(i:1) = $7f then
+                    # backspace (or 0x7F = delete, some terminals do this)
+                    if cmd_buf_len > 0 then
+                        cmd_buf_len = cmd_buf_len - 1
+                    end if
+                else
+                    if cmd_buf_len < 32 then
+                        # another byte to add on
+                        # convert to uppercase
+                        if in(i:1) > $60 && in(i:1) < $7b then
+                            in(i:1) = in(i:1) - $20 # $61 -> $41 = "a" -> "A"
+                        end if
+                        cmd_buf(cmd_buf_len:1) = in(i:1)
+                        cmd_buf_len = cmd_buf_len + 1
+                    #else
+                        # too many bytes, will be truncated
+                    end if
+                end if
+            end if
+            i = i + 1
+        end while
+    end if
+	end if
+end
+
+# catch TX watermark event (i.e. there is now enough space in the outgoing buffer)
+event system_endpoint_watermark_tx(endpoint, size)
+    # disable TX watermark
+    call system_endpoint_set_watermarks(USE_ENDPOINT, $ff, 0)
+    
+    # this TX operation kinda messes with the whole "TX watermark size" thing, since
+    # it transmits a big string ahead of what needs to go out for SPP behavior...so
+    # it should remain totally disabled even if you ARE debugging unless you REALLY
+    # need it
+    #if DEBUG_ENABLE = 1 then
+    #    # DEBUG
+    #    call system_endpoint_tx(USE_ENDPOINT, 24, "TX WATERMARKS DISABLED\r\n")
+    #end if
+
+    # send data IF IN DATA MODE (TX watermarks not used in command mode)
+    if (status_flags(0:1) & (1 << FLAG_IS_DATAMODE)) > 0 then
+        
+####		call system_endpoint_tx(USE_ENDPOINT, out_len, out(0:out_len))
+#### 23.8.2019 test
+		
+		#P .St. comment: hier wird data nach UART gespühlt CHECK value of :  out(0:1) 
+		# und wird damit in Terminal angezeigt; Falls KEIN Output erwünscht, lösche obige Zeile!
+    end if
+
+    # check if master or slave and respond appropriately
+    if (status_flags(0:1) & (1 << FLAG_IS_MASTER)) = 0 then
+        # this device is the slave
+        if ack_this_write(0:1) = 1 then
+            # acknowledge write since they used this mode
+            call attributes_user_write_response(0, 0)
+            ack_this_write(0:1) = 0
+        end if
+    else
+        # this device is the master
+        if config_page_3(17:1) = 0 then
+            call attclient_indicate_confirm(0)
+        end if
+    end if
+	
+# EXPLORE-IT  state machine here:	
+
+	# MARK_LED 
+	call hardware_io_port_write(0, $30, $30)
+					
+	if ROB_STATE = 6 then				#from command "E"  (0x45) : empfange data from app; has highest priority
+		if (ROB_count < ROB_MAX_FLASH+1) then				# (ROB_MAX_FLASH+1) upto VER_004
+			i=0
+			while i < out_len			# unused anymore here: cmd_buf(26:1) and cmd_buf(25:1)
+				call flash_write_data(ROB_count, 1, (out(i:1)))
+				ROB_count = ROB_count + 1
+				i = i + 1				
+			end while	
+			
+		else
+			temp_buf(0:4) = "FULL"
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))	
+			ROB_STATE = 3						# Set Mem Status correctly  
+			ROB_count = 0						# not needed actually
+		end if		
+	else										# ab hier werden alle anderen Befehle ausgewertet ...
+	
+
+		if out(0:1) = $55 then
+		#"U"  (0x55) : send status depending on ROB_state
+		# 0 = empty idle
+		# 1 = ready to run; Memory Empty	after stop we always end here; not yet implemented to distinguish empty/full
+		# 2 = learning
+		# 3 = learned, Memory full;  does it ever happen? evtl. not yet implemented 
+		# 4 = driving as learned
+		# 5 = beaming away data
+		# 6 = receiving data
+		# 7 = free running
+			if ROB_STATE = 0 then
+				temp_buf(0:4) = "_U0_"
+			end if
+			if ROB_STATE = 1 then
+				temp_buf(0:4) = "_U1_"
+			end if
+			if ROB_STATE = 2 then
+				temp_buf(0:4) = "_U2_"
+			end if
+			if ROB_STATE = 3 then
+				temp_buf(0:4) = "_U3_"
+			end if
+			if ROB_STATE = 4 then
+				temp_buf(0:4) = "_U4_"
+			end if
+			if ROB_STATE = 5 then
+				temp_buf(0:4) = "_U5_"
+			end if
+			if ROB_STATE = 6 then
+				temp_buf(0:4) = "_U6_"
+			end if
+			if ROB_STATE = 7 then
+				temp_buf(0:4) = "_U7_"
+			end if
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))	
+		end if
+
+		if out(0:1) = $5A then
+		#"Z"  (0x5A) : send version information; const: XPIT_VER; sent as 3 Ascii decimal digits
+		temp_buf(0:7) = "VER 006"
+		call attributes_write(c_spp_data_acknowledged, 0, 7, temp_buf(0:7))	
+		end if							# end of Z Command
+		
+		if out(0:1) = $4C then
+		#"L"  (0x4C) : Learn and save; 
+			ROB_count = 0									# counts later to fill memory
+			ROB_STATE = 2
+			temp_buf(0:4) = "_LR_"
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))
+			
+			# configure pin P1_x? as GPIO pin
+			call hardware_io_port_config_function(1, $00)
+			#prepare LEDs ON and Motors OFF  
+			# hardware_io_port_write(PORT=1, MASK=$07, VALUE=$03)
+			call hardware_io_port_write(1, $07, $03)		
+			
+			#call hardware_set_soft_timer(640, 11, 0)		# unfortunately we don't know the old value before; 640 = ca. 50ms
+			# new with SAMPLE_INTERVAL Value
+###			call hardware_set_soft_timer( ((51 - ROB_SAMPLE_INTERVAL) * 640), 11, 0)		# 
+###			call hardware_set_soft_timer(16640, 11, 0)		# 
+			call hardware_set_soft_timer( ( (50/ROB_SAMPLE_INTERVAL) * 640), 11, 0)		# try division
+			
+		end if
+
+		if out(0:1) = $42 then
+		#"B"  (0x42) : beam data to app; works
+
+# new with VER_004
+# removed with VER_006
+##			temp_buf(0:1)=$0D   #"CR" 
+##			temp_buf(1:1)=$0A   #"LF" 
+
+			
+# new VER_006			
+# transmit Value of: ROB_MAX_FLASH in two bytes
+			temp_buf(0:1)= (ROB_MAX_FLASH >> 8)  # witch ending? 	# first value = high byte 
+			temp_buf(1:1)= ROB_MAX_FLASH 							# second value = low byte
+			call attributes_write(c_spp_data_acknowledged, 0, 2, temp_buf(0:2))
+
+			ROB_paket_counter = 0
+			ROB_count = 0									# counts later to fill memory
+			i=1												# new with VER_005  counts char in current paket
+			ROB_STATE = 5
+#			call hardware_set_soft_timer(5120, 11, 0)		# unfortunately we don't know the old value before; 1280 (>640) needed for reliable transfer
+			call hardware_set_soft_timer(8192, 11, 0)		# unfortunately we don't know the old value before; 1280 (>640) needed for reliable transfer
+															# new note: 9.4.18: even longer, depending on what is done inside irq !!	
+										
+		end if												
+
+	
+		if out(0:1) = $47 then
+		#"G"  (0x47) : GO according data
+			ROB_STATE = 4
+			ROB_count = 0
+			temp_buf(0:4) = "_GR_"
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))
+			
+			#5.4.2018 tests only
+			# removed 3.20.2019 VER_004
+			
+			##temp_buf(20) = 1
+			
+
+			# switch LED=ON and Motor=ON; low active means Port P1.0 ...2=> "0"
+		
+			# hardware_io_port_write(PORT=1, MASK=$07, VALUE=$00)  lets try 0x03 to prevent DISC 0208 => no change ... :-(
+#			call hardware_io_port_write(1, $07, $03)			# LED On, motors should come with PWM
+			call hardware_io_port_write(1, $07, $07)			# LED OFF, motors should come with PWM
+			
+			# configure pin P1_0 and P1.1 as PWM pin
+			call hardware_io_port_config_function(1, $03)
+#			call hardware_io_port_config_function(1, $07)
+
+			#call hardware_set_soft_timer(640, 11, 0)			#  <=== make timer 640 or same as while converting
+			# new with SAMPLE_INTERVAL Value
+##			call hardware_set_soft_timer( ((51 - ROB_SAMPLE_INTERVAL) * 640), 11, 0)		# 
+##			call hardware_set_soft_timer(16640, 11, 0)		# 
+			call hardware_set_soft_timer( ( (50/ROB_SAMPLE_INTERVAL) * 640), 11, 0)		# try division
+			
+
+			
+		end if
+
+		if out(0:1) = $52 then
+		#"R"  (0x52) : free run    
+			ROB_STATE = 7
+			temp_buf(0:4) = "_RR_"
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))
+			
+			# configure pin P1_x? as GPIO pin
+			call hardware_io_port_config_function(1, $00)
+			
+			#prepare LEDs and Motors by setting them low=active; next command must be "S" to stop them
+			# hardware_io_port_write(PORT=1, MASK=$04, VALUE=$04)
+			call hardware_io_port_write(1, $07, $03)		
+		end if
+
+		
+		if out(0:1) = $53 then
+		#"S"  (0x53) : STOP any movement
+			ROB_STATE = 1
+			# stop motors
+			temp_buf(0:4) = "_SR_"
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))
+			# stop timer from GO Command 
+			call hardware_set_soft_timer(0, 11, 0)
+			# switch LED=OFF; low active means Port P1.2=> "1" ;ditto with motors
+			# configure pin P1_x? as GPIO pin
+			call hardware_io_port_config_function(1, $00)
+  			# hardware_io_port_write(PORT=1, MASK=$04, VALUE=$04)
+			call hardware_io_port_write(1, $07, $07)
+		end if	
+
+		if out(0:1) = $49 then
+		#"I"  (0x49) :  Save next value into permanent flash and use it from now on as sampling interval
+		
+			if out(1:1) = $3F then				# was "I?" ; convert value from flash into ascii code
+				call flash_ps_load($8008)(ret_result, ret_value_len, cmd_buf(25:1))  
+				temp_buf(0:2) = "I="
+				temp_buf(2:1) = (cmd_buf(25:1) / 10) + (cmd_buf(25:1) / -100 * 10) + 48
+				temp_buf(3:1) = cmd_buf(25:1) + (cmd_buf(25:1) / 10 * -10) + 48
+				#end if
+			else			
+				if out_len = 1 then					# was only "I" without number
+					temp_buf(0:4) = "_I?_"
+				end if
+			
+				if out_len = 2 then					# was "I" with single digit (or any additional character)
+					cmd_buf(25:1) = out(1:1) - 48
+					temp_buf(0:3) = "I_0"				
+					temp_buf(3:1) = out(1:1)		# rebounce value even it could be a character > 9 ; change below				
+					if cmd_buf(25:1) < 1 then
+						cmd_buf(25:1) = 1
+						temp_buf(3:1) = "1"
+					end if	
+					if cmd_buf(25:1) > 9 then
+						cmd_buf(25:1) = 9
+						temp_buf(3:1) = "9"			# ascii to be returned
+					end if	
+
+				end if
+			
+				if out_len = 3 then					# was "I" with two digits (or any additional characters)
+					cmd_buf(25:1) = ((out(1:1) - 48) * 10) + (out(2:1) - 48)
+					temp_buf(0:2) = "I_"				
+					temp_buf(2:2) = out(1:2)		# rebounce value even it could be a character > 9 ; change below
+					if cmd_buf(25:1) > 50 then
+						cmd_buf(25:1) = 50
+						temp_buf(0:4) = "Imax"
+					end if	
+					if cmd_buf(25:1) < 1 then
+						cmd_buf(25:1) = 1
+						temp_buf(0:4) = "Imin"
+					end if						
+				end if			
+			
+				if out_len > 3 then					# was "I" with more than 2 additional characters 
+					cmd_buf(25:1) = 50
+					temp_buf(0:4) = "Imax"
+				end if			
+		
+				call flash_ps_save($8008, 1, cmd_buf(25:1))				
+				ROB_SAMPLE_INTERVAL = cmd_buf(25:1)	
+				# adjust length accordingly 
+				call flash_ps_load($8006)(ret_result, ret_value_len, cmd_buf(25:1))  
+				# with VER = 002 following line no longer valid; ROB_MAX_FLASH is independend of ROB_SAMPLE_INTERVAL
+				# ROB_MAX_FLASH = (cmd_buf(25:1) * 2 * ROB_SAMPLE_INTERVAL ) - 1
+	
+			end if
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))	
+		end if		
+
+# klein-d ANFANG
+		if out(0:1) = $64 then
+		#"d"  (0x64) :			
+			if out(1:1) = $3F then				# was "d?" ; little endian: LSBYTE lower address
+				call flash_ps_load($8013)(ret_result, ret_value_len, cmd_buf(25:1))  # NEW 4 bytes used for HEX Value stored!!! 
+				call flash_ps_load($8014)(ret_result, ret_value_len, cmd_buf(26:1))
+				call flash_ps_load($8015)(ret_result, ret_value_len, cmd_buf(27:1))
+				call flash_ps_load($8016)(ret_result, ret_value_len, cmd_buf(28:1))
+				temp_buf(0:2) = "dx"
+				#temp_buf(2:1) = (cmd_buf(28:1)&$f)  + 48 + ((cmd_buf(28:1)&$f )/10*7) # MS byte 1's digit
+				#temp_buf(3:1) = (cmd_buf(27:1)&$f)  + 48 + ((cmd_buf(27:1)&$f )/10*7) #    byte 1's digit		
+				#temp_buf(4:1) = (cmd_buf(26:1)&$f)  + 48 + ((cmd_buf(26:1)&$f )/10*7) #    byte 1's digit
+				#temp_buf(5:1) = (cmd_buf(25:1)&$f)  + 48 + ((cmd_buf(25:1)&$f )/10*7) # LS byte 1's digit	
+
+				temp_buf(2:1) = (cmd_buf(28:1))		# copy to local variable for immediate transmission after d?
+				temp_buf(3:1) = (cmd_buf(27:1))	
+				temp_buf(4:1) = (cmd_buf(26:1))
+				temp_buf(5:1) = (cmd_buf(25:1))
+				
+				temp_buf(6:4) = "FLSH"				# change if you find something better 
+				#end if
+			else			
+				if out_len = 1 then					# was only "d" without number
+					temp_buf(0:10) = "_d????_HEX"
+				end if
+			
+#				if out_len = 2 then					# was "d" with single digit (or any additional character)
+#					temp_buf(0:3) = "d_x"				
+#					temp_buf(3:1) = out(1:1)		# rebounce value				
+#					temp_buf(4:6) = "???HEX"
+#				end if
+
+#				if out_len = 3 then					# was "d" with two HEX char (or any additional character)
+#					temp_buf(0:3) = "d_x"				
+#					temp_buf(3:1) = out(1:1)		# rebounce value
+#					temp_buf(4:1) = out(2:1)		# rebounce value				
+#					temp_buf(5:5) = "??HEX"
+#				end if
+
+#				if out_len = 4 then					# was "d" with three HEX char (or any additional character)
+#					temp_buf(0:3) = "d_x"				
+#					temp_buf(3:1) = out(1:1)		# rebounce value
+#					temp_buf(4:1) = out(2:1)		# rebounce value
+#					temp_buf(5:1) = out(3:1)		# rebounce value				
+#					temp_buf(6:4) = "?HEX"
+#				end if
+				
+				if out_len = 5 then					# was "d" with four hex chars (or any additional characters)
+					temp_buf(0:2) = "d_"				
+					temp_buf(2:1) = out(1:1)		# rebounce value  MSBYTE
+					cmd_buf(28:1) = out(1:1)		# make ready for immediate save
+					temp_buf(3:1) = out(2:1)		# rebounce value 
+					cmd_buf(27:1) = out(2:1)		# make ready for immediate save
+					temp_buf(4:1) = out(3:1)		# rebounce value 
+					cmd_buf(26:1) = out(3:1)		# make ready for immediate save
+					temp_buf(5:1) = out(4:1)		# rebounce value LSBYTE
+					cmd_buf(25:1) = out(4:1)		# make ready for immediate save
+					temp_buf(6:4) = "_ok_"
+					if out(1:1) > $31 then			# value was higher than 0x1FFF  = 8191
+						cmd_buf(28:1) = "1"
+						cmd_buf(27:1) = "F"
+						cmd_buf(26:1) = "F"
+						cmd_buf(25:1) = "F"
+						temp_buf(0:10) = "dmax=x1FFF"
+					end if	
+					if out(4:1) < $31 && out(3:1) < $31	&& out(2:1) < $31 && out(1:1) < $31		# value was lower than 0x0001 ; 0x31 is dec49
+						cmd_buf(28:1) = "0"
+						cmd_buf(27:1) = "0"
+						cmd_buf(26:1) = "0"
+						cmd_buf(25:1) = "1"
+						temp_buf(0:10) = "dmin=x0001"
+					end if						
+				end if			
+			
+#				if out_len > 5 then					# was "D" with more than 4 additional characters 
+#					cmd_buf(28:1) = "1"
+#					cmd_buf(27:1) = "E"
+#					cmd_buf(26:1) = "E"
+#					cmd_buf(25:1) = "E"
+#					temp_buf(0:10) = "dmax=x1FFF"		# 32k 16k 8k 4k 2k 1k 512 256  0xFF
+#				end if			
+		
+				call flash_ps_save($8013, 1, cmd_buf(25:1))			# VER 002:   4 bytes !!!!!!	 LSBYTE Endian !!!
+				call flash_ps_save($8014, 1, cmd_buf(26:1))			# VER 002:   4 bytes !!!!!!	 			
+				call flash_ps_save($8015, 1, cmd_buf(27:1))			# VER 002:   4 bytes !!!!!!	 
+				call flash_ps_save($8016, 1, cmd_buf(28:1))			# VER 002:   4 bytes !!!!!!	 MSByte !!!					
+
+				# calculate FLASHPOINTER; Conversion of 4 HEX CHAR to INT-Value
+				if cmd_buf(28:1) > $40 then						# check if CHAR?
+					hex_index = (cmd_buf(28:1) - 55) << 4		# only CAPITAL CHARs are correct!!
+				else											# was a number
+					hex_index = (cmd_buf(28:1) - 48) << 4
+				end if
+			
+				if cmd_buf(27:1) > $40 then
+					hex_index = ( hex_index + (cmd_buf(27:1) - 55) ) << 4
+				else
+					hex_index = ( hex_index + (cmd_buf(27:1) - 48) ) << 4
+				end if
+	
+				if cmd_buf(26:1) > $40 then
+					hex_index = ( hex_index + (cmd_buf(26:1) - 55) ) << 4
+				else
+					hex_index = ( hex_index + (cmd_buf(26:1) - 48) ) << 4
+				end if
+
+				if cmd_buf(25:1) > $40 then
+					hex_index = hex_index + (cmd_buf(25:1) - 55)
+					else
+					hex_index = hex_index + (cmd_buf(25:1) - 48)
+				end if
+
+				if hex_index > ROB_MAX_FLASH_CONST then	 # last time limit check; no correction done here for FLASH content!
+					hex_index = ROB_MAX_FLASH_CONST
+				end if	
+				#temp_buf(0:1) = "/"
+				#temp_buf(1:1) = (hex_index / 4096) + 48
+				#temp_buf(2:1) = (hex_index / 2048) + 48
+				#temp_buf(3:1) = (hex_index / 1024) + 48			
+				#temp_buf(4:1) = (hex_index / 512) + 48
+				#temp_buf(5:1) = (hex_index / 256) + 48
+				#temp_buf(6:1) = (hex_index / 128) + 48
+				#temp_buf(7:1) = (hex_index / 64) + 48
+				#temp_buf(8:1) = (hex_index / 32) + 48
+				#temp_buf(9:1) = (hex_index / 16) + 48
+
+				#ROB_MAX_FLASH = (cmd_buf(25:1) * 100 ) - 1	
+				# adjust length accordingly 
+				# don't forget	was until now: 	ROB_MAX_FLASH = (cmd_buf(25:1) * 2 * ROB_SAMPLE_INTERVAL ) - 1
+				ROB_MAX_FLASH = hex_index
+		
+			end if  			# end of d? else 
+			# send response of d command
+			call attributes_write(c_spp_data_acknowledged, 0, 10, temp_buf(0:10))
+			
+		end if
+# klein-d ENDE		
+				
+		if out(0:1) = $45 then
+		#"E"  (0x45) : empfange data from app
+			cmd_buf(25:1) = 0			# counter for 3 numbers and space; mark hundreds position
+			cmd_buf(26:1) = 0			# clear sum var
+			ROB_STATE = 6
+			ROB_count = 0
+			LR_FLAG = 0					# expect LEFT Motor data as next value
+			temp_buf(0:4) = "_ER_"		# send: EReady
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))
+			call hardware_set_soft_timer(32000, 11, 0)	# make it slow so it doesn't interrupt too often for nothing in state6
+													# but is important to have one, else some command won't work properly
+		end if
+
+
+		if out(0:1) = $46 then
+		#"F"  (0x46) : [F]orget memory ; 
+			ROB_count = 0				# counts later to fill memory
+			ROB_STATE = 9
+			while ROB_count < 5                   #we have 4 flash pages 4*2kB
+				call flash_erase_page(ROB_count)
+				ROB_count = ROB_count + 1
+			end while
+			ROB_STATE = 0				# now empty/clear/nada	
+			ROB_count = 0				# RESET Counter ; should not be necessary here
+			temp_buf(0:8) = "MEMCLEAR"		# send: Confirmation
+			call attributes_write(c_spp_data_acknowledged, 0, 8, temp_buf(0:8))
+		end if
+
+		
+	end if							# hier ist das Ende der Eingangsabfrage
+	
+	# MARK_LED 
+	call hardware_io_port_write(0, $30, $00)
+	
+# EXPLORE-IT end of state machine	
+
+end
+
+# catch "indicated" event so we know data has arrived (if using acknowledged transfers)
+event attclient_indicated(connection, handle)
+    # enable RX watermark
+    call system_endpoint_set_watermarks(USE_ENDPOINT, config_page_4(0:1), $ff)
+
+    if DEBUG_ENABLE = 1 then
+        # DEBUG
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 23, "RX WATERMARKS ENABLED\r\n")
+    end if
+end
+
+# catch "procedure completed", the acknowledgement of setup operations done on the slave
+event attclient_procedure_completed(connection, result, handle)
+    if (handle = (c_spp_data_acknowledged + 1) ) then			#VER_004
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 34, "IND/NOTIF SUBSCRIPTION COMPLETED\r\n")
+        end if
+
+        # enable RX watermark
+        call system_endpoint_set_watermarks(USE_ENDPOINT, config_page_4(0:1), $ff)
+
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 23, "RX WATERMARKS ENABLED\r\n")
+        end if
+
+        # send DATA event
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 6, "DATA\r\n")
+
+        # update status
+        status_flags(0:1) = status_flags(0:1) | (1 << FLAG_IS_DATAMODE)
+        #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+    end if
+
+    if (handle = c_spp_data_acknowledged) then						#VER_004
+        call system_endpoint_set_watermarks(USE_ENDPOINT, config_page_4(0:1), $ff) # set RX watermark
+
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 23, "RX WATERMARKS ENABLED\r\n")
+        end if
+    end if
+end
+
+# catch notified/indicated data from the slave
+event attclient_attribute_value(connection, handle, type, value_len, value_data)
+    if (handle = c_spp_data_acknowledged) then
+        out_len = value_len
+        memcpy(out(0), value_data(0), out_len)
+        call system_endpoint_set_watermarks(USE_ENDPOINT, $ff, out_len) # set TX watermark
+
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 23, "TX WATERMARKS ENABLED\r\n")
+        end if
+    end if
+end
+
+# catch remote write of characteristic value
+# NOTE! This function or something similar MUST remain in the BGScript to
+# allow access to DFU mode by triggering from a characteristic value update
+event attributes_value(connection, reason, handle, offset, value_len, value_data)
+    if (handle = c_spp_data_acknowledged) then
+        # store data to send to host as soon as endpoint TX buffer space is available
+        out_len = value_len
+        memcpy(out(0), value_data(0), out_len)
+        call system_endpoint_set_watermarks(USE_ENDPOINT, $ff, out_len) # set TX watermark
+        ack_this_write(0:1) = 1
+
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 23, "TX WATERMARKS ENABLED\r\n")
+        end if
+    else
+ 
+            if ((handle = c_spp_config) && (value_len > 1)) then
+                # remote client is reconfiguring module
+                
+                if DEBUG_ENABLE = 1 then
+                    # DEBUG
+					# Ver. 1.1.0 next line remarked 
+                    ##call system_endpoint_tx(USE_ENDPOINT, 8, "RECONF: ")
+                    k = 0
+                    while k < value_len
+                        temp_buf(16:1) = (value_data(k:1)/$10) + 48 + ((value_data(k:1)/$10)/10*7)
+                        temp_buf(17:1) = (value_data(k:1)&$f)  + 48 + ((value_data(k:1)&$f )/10*7)
+                        temp_buf(18:1) = $20
+						# Ver. 1.1.0 next line remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(16:3))
+                        k = k + 1
+                    end while
+					# Ver. 1.1.0 next line remarked 
+                    ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+                end if
+
+                k = $80 # default state is error
+                if value_data(0:1) = 1 && value_len = 4 then
+                    k = 0
+                    # config page 1 - identification keys
+                    #config_page_1(0:1) = $00    # connection key MSB \___ default 0x0000
+                    #config_page_1(1:1) = $00    # connection key LSB /
+                    #config_page_1(2:1) = $00    # connection channel, default 0x00
+                    memcpy(config_page_1(0), value_data(1), 3)
+                    call flash_ps_save($8001, 3, config_page_1(0:3))
+
+                    # update advertisement data
+                    adv_data(25:1) = config_page_1(0:1) # connection key MSB
+                    adv_data(26:1) = config_page_1(1:1) # connection key LSB
+                    adv_data(27:1) = config_page_1(2:1) # connection channel
+
+                    # set custom advertisement data (i.e. services and manufacturer data)
+                    call gap_set_adv_data(0, 28, adv_data(0:28))
+                end if
+
+                if value_data(0:1) = 2 && value_len <= 17 then
+                    k = 0
+                    # config page 2 - device name (16 bytes or less)
+                    #config_page_2(0:1) = $10    # device name length
+                    #config_page_2(1:1) = $xx    # device name data...
+                    #...
+                    #config_page_2(16:1) = $xx
+                    config_page_2(0:1) = value_len - 1
+                    memcpy(config_page_2(1), value_data(1), value_len - 1)
+                    call flash_ps_save($8002, value_len, config_page_2(0:value_len))(ret_result)
+
+                    # update scan response data
+                    sr_data(3:1) = 1 + config_page_2(0:1)   # ad field length
+                    sr_data(4:1) = gap_ad_type_localname_complete   # ad field type = 0x09 (Complete local name)
+                    memcpy(sr_data(5), config_page_2(1), config_page_2(0:1))
+                    
+                    # set custom scan response data (i.e. TX power and device name)
+                    call gap_set_adv_data(1, 5 + config_page_2(0:1), sr_data(0:5 + config_page_2(0:1)))
+                end if
+                
+                if value_data(0:1) = 3 && value_len = 19 then
+                    k = 0
+                    # config page 3 - BLE connection
+                    #config_page_3(0:1) = $00    # role, default master/slave ping-pong; for XPIT declared as 2 Autoslave
+                    #config_page_3(1:1) = $04    # ping-pong time to split between ad/scan, default 4 sec
+                    #config_page_3(2:2) = $00c8  # scan interval, default 125ms (200 * 0.625ms)
+                    #config_page_3(4:2) = $00c8  # scan window, default 125ms (200 * 0.625ms)
+                    #config_page_3(6:2) = $0200  # advertisement interval, default 320ms (512 * 0.625ms)
+                    #config_page_3(8:2) = $0010  # connection interval, default 20ms (16 * 1.25ms)
+                    #config_page_3(10:2) = $0064 # supervision timeout, default 1000ms (100 * 10ms)
+                    #config_page_3(12:2) = $0000 # slave latency, default 0
+                    #config_page_3(14:1) = $05   # connection attempt timeout, default 5 seconds
+                    #config_page_3(15:1) = $00   # connection update delegation, default 0 = slave requests
+                    #config_page_3(16:1) = $00   # security, default disabled (no encryption required)
+                    #config_page_3(17:1) = $00   # transmission type, default safe (indications)
+                    memcpy(config_page_3(0), value_data(1), 18)
+                    call flash_ps_save($8003, 18, config_page_3(0:18))
+
+                    # set scan parameters to according to options, and use passive scanning
+                    call gap_set_scan_parameters(config_page_3(2:2), config_page_3(4:2), 0)
+
+                    # set advertisement interval to according to options, and use all advertisement channels
+                    call gap_set_adv_parameters(config_page_3(6:2), config_page_3(6:2) + $10, 7)
+                end if
+                    
+                if value_data(0:1) = 4 && value_len = 6 then
+                    if value_data(1:1) < 65 && value_data(4:1) < 2 && value_data(5:1) < 2 then
+                        k = 0
+                        # config page 4 - host interface
+                        #config_page_4(0:1) = $01    # outgoing watermark, default 1 byte (any/all data)
+                        #config_page_4(1:1) = $d8    # UART baud rate mantissa, default 0xD8 (216) \___ 115,200
+                        #config_page_4(2:1) = $0b    # UART baud rate exponent, default 0x0B (11)  /
+                        #config_page_4(3:1) = $01    # flow control, default enabled
+                        #config_page_4(4:1) = $00    # debug output, default disabled
+                        memcpy(config_page_4(0), value_data(1), 5)
+                        call flash_ps_save($8004, 5, config_page_4(0:5))
+
+                        # apply baud rate settings (USART1)
+                        call system_reg_write($70fa, config_page_4(1:1))    # mantissa, BAUD_M
+                        call system_reg_write($70fc, config_page_4(2:1))    # exponent, BAUD_E 
+                        
+                        # apply flow control settings (USART1)
+                        call system_reg_write($70fb, 2 | (config_page_4(3:1) << 6)) # flow + stop bit setting
+                    end if
+                end if
+                    
+                if value_data(0:1) = 5 && value_len = 3 then
+                    if value_data(1:1) < $0f && value_data(2:1) < 2 then
+                        k = 0
+                        # config page 5 - power management
+                        #config_page_5(0:1) = $0e    # TX power, 15 default (max)
+                        #config_page_5(1:1) = $00    # sleep mode, default disabled
+                        call flash_ps_save($8005, 2, config_page_5(0:2))
+                        memcpy(config_page_5(0), value_data(1), 2)
+
+                        # update TX power level based on config
+                        call hardware_set_txpower(config_page_5(0:1))
+                    end if
+                end if
+                
+                # acknowledge write (if k != 0, then client will receive error response)
+                call attributes_user_write_response(0, k)
+            else
+                if ((handle = c_spp_config) && (value_len = 1)) then
+                    # remote client requested to *read* certain config, or reset all settings
+
+                    if value_data(0:1) = $fe then
+                        # send RESET event
+						# Ver. 1.1.0 next line remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 7, "RESET\r\n")
+                        
+                        # mark settings as uninitialized and reboot
+                        temp_buf(0:1) = $00
+                        call flash_ps_save($8000, 1, temp_buf(0:1))
+                        call system_reset(0)
+                    end if
+
+                    k = $80 # default state is error
+                    if value_data(0:1) < 6 then
+                        k = 0 # no error
+                        temp_buf(0:1) = value_data(0:1)
+                    end if
+                    
+                    # acknowledge write (if k != 0, then client will receive error response)
+                    call attributes_user_write_response(0, k)
+
+                    # send back appropriate info
+                    if value_data(0:1) = 1 then
+                        memcpy(temp_buf(1), config_page_1(0), 3)
+                        call attributes_write(c_spp_config, 0, 4, temp_buf(0:4))
+                    end if
+                    if value_data(0:1) = 2 then
+                        memcpy(temp_buf(1), config_page_2(1), config_page_2(0:1))
+                        call attributes_write(c_spp_config, 0, config_page_2(0:1) + 1, temp_buf(0:config_page_2(0:1) + 1))
+                    end if
+                    if value_data(0:1) = 3 then
+                        memcpy(temp_buf(1), config_page_3(0), 19)
+                        call attributes_write(c_spp_config, 0, 19, temp_buf(0:19))
+                    end if
+                    if value_data(0:1) = 4 then
+                        memcpy(temp_buf(1), config_page_4(0), 6)
+                        call attributes_write(c_spp_config, 0, 6, temp_buf(0:6))
+                    end if
+                    if value_data(0:1) = 5 then
+                        memcpy(temp_buf(1), config_page_5(0), 3)
+                        call attributes_write(c_spp_config, 0, 3, temp_buf(0:3))
+                    end if
+                else
+                    if ((handle = c_dfu_reboot_trigger) && (value_data(0:1) )) = $ff then
+                        # remote client requested DFU reboot
+
+                        # send DFU event
+						# Ver. 1.1.0 next line remarked 
+                        ##call system_endpoint_tx(USE_ENDPOINT, 5, "DFU\r\n")
+                        call system_reset(1)
+                    end if
+                end if
+            end if
+        
+    end if
+end
+
+# Note PST: following should only happen at boot time according app note description page 24
+#           must be activated in line 273 with:  call hardware_io_port_config_irq(0, $42, 0)
+# catch interrupts for PORT0 input pins (active HIGH configuration, hardware.xml pulls them low)
+event hardware_io_port_status(delta, port, irq, state)
+    if port = 0 then
+        # save new PORT0 state (only care about P0_1/6 at this point)
+        gpio_input_state(0:1) = state & $42
+
+#        
+#        # stack automatically handles P0_0 for wake-up, so we don't process it
+#        if (irq & 2) = 2 then
+#            # P0_1 asserted, exit DATA mode if we're in it
+#            if (status_flags(0:1) & (1 << FLAG_IS_DATAMODE)) > 0 then
+#                status_flags(0:1) = status_flags(0:1) ^ (1 << FLAG_IS_DATAMODE)
+#                #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+#
+#                # send READY event since we will now accept commands
+#				# Ver. 1.1.0 next line remarked 
+#                ##call system_endpoint_tx(USE_ENDPOINT, 7, "READY\r\n")
+#            else
+#                # not in DATA mode, to go back into it if available
+#                if (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) > 0 then
+#                    # update status (set datamode)
+#                    status_flags(0:1) = status_flags(0:1) ^ (1 << FLAG_IS_DATAMODE)
+#                    #PST#call hardware_io_port_write(1, $03, status_flags(0:1))
+#
+#                    # send DATA event
+#					# Ver. 1.1.0 next line remarked 
+#                    ##call system_endpoint_tx(USE_ENDPOINT, 6, "DATA\r\n")
+#                end if
+#            end if
+#        end if
+#		
+
+#        if (irq & $40) = $40 then
+#            # P0_6 asserted, disconnect and stop ad/scan
+#            if (status_flags(0:1) & (1 << FLAG_IS_CONNECTED)) > 0 then
+#                # disconnect, since we're already connected		
+#                call connection_disconnect(0)
+#            else
+#                # make sure we stop scanning or advertising immediately
+#                call gap_end_procedure()
+#                call gap_set_mode(0, 0)
+#            end if
+#        end if
+		
+		
+    end if
+end
+
+# catch ADC result (used when reading internal temperature sensor for pseudo-random seed
+event hardware_adc_result(input, value)
+    if input = 14 then
+        # use ambient temperature to augment random seed
+        rand_factor = rand_factor * value
+        
+        # initialize adv/scan time difference
+        j = rand_factor & $ffff
+        if j < $8000 then
+            i = 16384 + (j >> 3)
+        else
+            i = 16384 - (j >> 3)
+        end if
+        
+        pp_time_advertising = config_page_3(1:1) * i
+        pp_time_scanning = config_page_3(1:1) * (32768 - i)
+
+        if DEBUG_ENABLE = 1 then
+            # DEBUG
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 6, "RAND: ")
+            i = 0
+            temp_buf(4:4) = rand_factor
+            while i < 4
+                temp_buf(0:1) = (temp_buf(i+4:1)/$10) + 48 + ((temp_buf(i+4:1)/$10)/10*7)
+                temp_buf(1:1) = (temp_buf(i+4:1)&$f)  + 48 + ((temp_buf(i+4:1)&$f )/10*7)
+                temp_buf(2:1) = $20
+				# Ver. 1.1.0 next line remarked 
+                ##call system_endpoint_tx(USE_ENDPOINT, 3, temp_buf(0:3))
+                i = i + 1
+            end while
+			# Ver. 1.1.0 next line remarked 
+            ##call system_endpoint_tx(USE_ENDPOINT, 2, "\r\n")
+        end if
+
+        # enable RX watermarks only (for processing commands)
+        call system_endpoint_set_watermarks(USE_ENDPOINT, 1, 0)
+
+        # send READY event since we will now accept commands
+		# Ver. 1.1.0 next line remarked 
+        ##call system_endpoint_tx(USE_ENDPOINT, 7, "READY\r\n")
+
+        if config_page_3(0:1) = BLEROLE_MASTER then
+            status_flags(1:1) = 1 # auto-connect enabled
+        end if
+        if config_page_3(0:1) = BLEROLE_PINGPONG then
+            status_flags(1:1) = 3 # auto-connect enabled, ping-pong mode enabled
+        end if
+        call start_spp_role(config_page_3(0:1))
+    end if
+	
+	# place here EXPLORE-IT stuff
+	if ROB_STATE = 2 then									# from learn command; will be triggered twice: once from timerirq; second from itself 6 lines below
+		if input=1 then										
+			call flash_write_data(ROB_count, 1, value >> 7)	#  Single ended is always positive result, so we forget sign bit with shift >>7
+		end if
+		
+		if input=0 then
+			call flash_write_data(ROB_count, 1, value >> 7)	
+			call hardware_adc_read(1,3,2) 					#startet conversion: CH1 = 	for right motor channel	; ref is AVDD;
+		end if
+
+		if ROB_count > ROB_MAX_FLASH then					# send end character FULL
+			temp_buf(0:4) = "FULL"
+			call attributes_write(c_spp_data_acknowledged, 0, 4, temp_buf(0:4))	
+			ROB_STATE = 3									# full=ready for run 
+			call hardware_set_soft_timer(0, 11, 0)			# unfortunately we don't know the old value before; 640 = ca. 50ms
+			# configure pin P1_x? as GPIO pin
+			call hardware_io_port_config_function(1, $00)
+  			# hardware_io_port_write(PORT=1, MASK=$07, VALUE=$07) means: stop LEDs and Motors
+			call hardware_io_port_write(1, $07, $07)
+			
+		else
+			ROB_count = ROB_count + 1
+		end if
+	end if
+end
